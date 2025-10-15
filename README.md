@@ -9,7 +9,7 @@
 - [Документация](./docs/)  
 - [Даташиты](./datasheets/)
 - [Ссылки](./links/links.md)
-- [График]([https://docs.docker.com/](https://docs.google.com/spreadsheets/d/1RWUDlwNgSnQZzl1ud5IH15s1hvJBND-iSX5JjFd0lDk/edit?gid=0#gid=0)  
+- [График](https://docs.google.com/spreadsheets/d/1RWUDlwNgSnQZzl1ud5IH15s1hvJBND-iSX5JjFd0lDk/edit?gid=0#gid=0)  
 
 ## 🐀 Мои бусечки 
 
