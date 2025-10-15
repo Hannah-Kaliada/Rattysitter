@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Радионяня - Контроль и Управление</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      height: 100vh;
+      display: flex;
+    }
+
+    .left {
+      width: 50%;
+      padding: 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      background-color: #ffffff;
+    }
+
+    .right {
+      width: 50%;
+      background: url('https://img.freepik.com/premium-vector/baby-giraffe-cute-animal-sitting-vector-design-stickers-baby-shower-nursery-art-adorable-giraffe-kids-isolated-vector-clipart_145790-1194.jpg?w=1060') no-repeat center center;
+      background-size: contain;
+      background-color: #ffffff;
+    }
+
+    h1 {
+      margin: 10px;
+      color: #333;
+    }
+
+    button {
+      margin-top: 15px;
+      padding: 12px 24px;
+      background-color: #815315;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      border-radius: 10px;
+      font-size: 16px;
+      transition: background-color 0.3s;
+    }
+
+    button:hover {
+      background-color: #45a049;
+    }
+
+    .controls {
+      margin-top: 30px;
+      background: rgba(245, 245, 245, 0.95);
+      padding: 20px;
+      border-radius: 20px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.2);
+      width: 100%;
+      max-width: 700px;
+    }
+
+    .slider-container {
+      margin: 10px 0;
+    }
+
+    label {
+      display: inline-block;
+      width: 30px;
+      font-weight: bold;
+    }
+
+    input[type="range"] {
+      width: 200px;
+    }
+    
+    .chart-container {
+      margin-top: 20px;
+      width: 100%;
+      height: 200px;
+    }
+  </style>
+</head>
+<body>
+  <div class="left">
+    <h1>Радионяня – Комната ребенка</h1>
+
+    <div class="controls">
+      <h2>Аудио</h2>
+      <button id="toggleButton">Старт</button>
+
+      <h2 style="margin-top:30px;">RGB LED</h2>
+      <div class="slider-container">
+        <label for="r">R:</label>
+        <input id="r" type="range" min="0" max="255" value="0">
+      </div>
+      <div class="slider-container">
+        <label for="g">G:</label>
+        <input id="g" type="range" min="0" max="255" value="0">
+      </div>
+      <div class="slider-container">
+        <label for="b">B:</label>
+        <input id="b" type="range" min="0" max="255" value="0">
+      </div>
+      <button onclick="sendColor()">Отправить цвет</button>
+
+      <div class="preset-container">
+        <h2>Программы ночника</h2>
+        <select id="presetSelector" onchange="startPresetProgram()">
+          <option value="">-- Выбери программу --</option>
+          <option value="warmSleep">Тёплый сон</option>
+          <option value="heartbeat">Сердцебиение</option>
+          <option value="breathing">Дыхание</option>
+          <option value="sunrise">Рассвет</option>
+          <option value="sunset">Закат</option>
+          <option value="starlight">Звёздная ночь</option>
+          <option value="rainbow">Радуга</option>
+        </select>
+        <div style="margin-top:10px;">
+
+          <h1>Микроклимат комнаты малыша🍼</h1>
+          <div>Температура: <span id="temperature">—</span></div>
+          <div>Влажность: <span id="humidity">—</span></div>
+          <div>Освещённость: <span id="lux">—</span></div>
+
+          <div class="chart-container">
+            <canvas id="tempChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="right"></div>
+<script>
+  const sourceSampleRate = 16000;
+  const targetSampleRate = 44100;
+  const wsUrl = `ws://${location.host}/ws`;
+
+
+  let audioContext = null;
+  let ws = null;
+  let streaming = false;
+  let resamplerNode = null;
+  let gainNode = null;
+  let tempChart = null;
+
+  function initChart(labels = [], data = []) {
+    const ctx = document.getElementById('tempChart').getContext('2d');
+    tempChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Температура (°C)',
+          data: data,
+          fill: false,
+          tension: 0.1
+        }]
+      },
+      options: {
+        scales: {
+          x: {
+            display: true,
+            title: {
+              display: true,
+              text: 'Время'
+            }
+          },
+          y: {
+            display: true,
+            title: {
+              display: true,
+              text: '°C'
+            }
+          }
+        }
+      }
+    });
+  }
+
+  async function updateHistory() {
+    try {
+      const res = await fetch('/getSensorHistory');
+      const history = await res.json();
+      const labels = history.map(item => new Date(item.timestamp * 1000).toLocaleTimeString());
+      const data = history.map(item => {
+        const match = item.data.match(/TEMP:([\d.]+);/);
+        return match ? parseFloat(match[1]) : null;
+      });
+      if (tempChart) {
+        tempChart.data.labels = labels;
+        tempChart.data.datasets[0].data = data;
+        tempChart.update();
+      } else {
+        initChart(labels, data);
+      }
+    } catch (e) {
+      console.error('Ошибка загрузки истории:', e);
+    }
+  }
+
+  setInterval(updateHistory, 60000);
+  updateHistory();
+
+  const workletCode = `
+    class ResamplerProcessor extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.buffer = [];
+        this.readIndex = 0;
+        this.ratio = ${targetSampleRate} / ${sourceSampleRate};
+        this.port.onmessage = (event) => {
+          const chunk = event.data;
+          for (let i = 0; i < chunk.length; i++) {
+            this.buffer.push(chunk[i]);
+          }
+        };
+      }
+
+      process(inputs, outputs) {
+        const output = outputs[0][0];
+        const outputLength = output.length;
+        const increment = 1 / this.ratio;
+
+        for (let i = 0; i < outputLength; i++) {
+          const pos = this.readIndex;
+          const indexInt = Math.floor(pos);
+          const frac = pos - indexInt;
+          let sample = 0;
+          if (indexInt + 1 < this.buffer.length) {
+            sample = this.buffer[indexInt] * (1 - frac) + this.buffer[indexInt + 1] * frac;
+          }
+          output[i] = sample;
+          this.readIndex += increment;
+        }
+
+        const consumed = Math.floor(this.readIndex);
+        if (consumed > 0) {
+          this.buffer.splice(0, consumed);
+          this.readIndex -= consumed;
+        }
+        return true;
+      }
+    }
+    registerProcessor('resampler-processor', ResamplerProcessor);
+  `;
+
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  const blobURL = URL.createObjectURL(blob);
+
+  async function startStreaming() {
+    try {
+      if (!audioContext || audioContext.state === 'closed') {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: targetSampleRate });
+      }
+
+      await audioContext.audioWorklet.addModule(blobURL);
+      resamplerNode = new AudioWorkletNode(audioContext, 'resampler-processor');
+      gainNode = audioContext.createGain();
+      gainNode.gain.value = 1;
+
+      resamplerNode.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        console.log("WebSocket подключен");
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          const match = event.data.match(/TEMP:([\d.]+);HUM:([\d.]+);LUX:([\d.]+)/);
+          if (match) {
+            document.getElementById("temperature").textContent = parseFloat(match[1]).toFixed(1) + ' °C';
+            document.getElementById("humidity").textContent = parseFloat(match[2]).toFixed(1) + ' %';
+            document.getElementById("lux").textContent = parseFloat(match[3]).toFixed(1) + ' lx';
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          const int16Data = new Int16Array(event.data);
+          const float32Data = new Float32Array(int16Data.length);
+          for (let i = 0; i < int16Data.length; i++) {
+            float32Data[i] = int16Data[i] / 32768;
+          }
+          resamplerNode.port.postMessage(float32Data);
+        }
+      };
+
+      ws.onerror = (e) => console.error('WebSocket ошибка:', e);
+      ws.onclose = () => console.log("WebSocket закрыт");
+
+    } catch (err) {
+      console.error("Ошибка запуска стрима:", err);
+    }
+  }
+
+  function stopStreaming() {
+    if (ws) ws.close();
+    if (resamplerNode) resamplerNode.disconnect();
+    if (gainNode) gainNode.disconnect();
+  }
+
+  document.getElementById('toggleButton').addEventListener('click', async () => {
+    if (!streaming) {
+      if (audioContext?.state === 'suspended') await audioContext.resume();
+      await startStreaming();
+      document.getElementById('toggleButton').textContent = 'Стоп';
+      streaming = true;
+    } else {
+      stopStreaming();
+      document.getElementById('toggleButton').textContent = 'Старт';
+      streaming = false;
+    }
+  });
+
+  async function sendColor() {
+    const r = document.getElementById("r").value;
+    const g = document.getElementById("g").value;
+    const b = document.getElementById("b").value;
+    const url = `/setColor?r=${r}&g=${g}&b=${b}`;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) console.error("Ошибка при отправке цвета", response.status);
+    } catch (error) {
+      console.error("Ошибка сети:", error);
+    }
+  }
+    const presets = {
+    warmSleep: { steps: [[30, 0, 0], [0, 0, 60]], duration: 3000 },
+    heartbeat: { steps: [[255, 0, 0], [50, 0, 0]], duration: 1000 },
+    breathing: { steps: [[0, 0, 0], [0, 0, 150]], duration: 3000 },
+    sunrise: { steps: [[0, 0, 0], [255, 150, 50]], duration: 5000 },
+    sunset: { steps: [[255, 150, 50], [0, 0, 0]], duration: 5000 },
+    starlight: { steps: [[0, 0, 20], [0, 0, 0]], duration: 2000 },
+    rainbow: {
+      steps: [
+        [255, 0, 0], [255, 127, 0], [255, 255, 0],
+        [0, 255, 0], [0, 0, 255], [75, 0, 130], [139, 0, 255]
+      ],
+      duration: 10000
+    }
+  };
+
+  let presetInterval = null;
+
+  function stopCurrentPreset() {
+    if (presetInterval) {
+      clearInterval(presetInterval);
+      presetInterval = null;
+    }
+  }
+
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function runPreset(name) {
+    stopCurrentPreset();
+    const preset = presets[name];
+    if (!preset) return;
+
+    const { steps, duration } = preset;
+    const seg = duration / (steps.length - 1);
+    let idx = 0;
+
+    presetInterval = setInterval(() => {
+      const [r0, g0, b0] = steps[idx];
+      const [r1, g1, b1] = steps[(idx + 1) % steps.length];
+      const startTime = Date.now();
+
+      function animate() {
+        const now = Date.now();
+        const t = Math.min((now - startTime) / seg, 1);
+        const r = Math.round(lerp(r0, r1, t));
+        const g = Math.round(lerp(g0, g1, t));
+        const b = Math.round(lerp(b0, b1, t));
+        fetch(`/setColor?r=${r}&g=${g}&b=${b}`);
+        if (t < 1) {
+          requestAnimationFrame(animate);
+        }
+      }
+
+      animate();
+      idx = (idx + 1) % steps.length;
+    }, seg);
+  }
+
+  document.getElementById("presetSelector").addEventListener("change", (e) => {
+    const selected = e.target.value;
+    if (selected) runPreset(selected);
+    else stopCurrentPreset();
+  });
+</script>
+
+</body>
+</html>
