@@ -1,0 +1,2 @@
+https://www.espressif.com/en/solutions/low-power-solutions/esp-now
+https://randomnerdtutorials.com/esp-now-esp32-arduino-ide/
