@@ -6,8 +6,13 @@
 #include "driver/i2s.h"
 #include "time.h"
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_PWMServoDriver.h>
+
+#define LED_R_CH 0
+#define LED_G_CH 1
+#define LED_B_CH 2
+
+Adafruit_PWMServoDriver pca(0x40);
 
 const char* ssid = "Clown";
 const char* password = "12345678";
@@ -30,10 +35,7 @@ const char* serverUrl = "http://10.241.52.96:8080/upload";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-#define OLED_WIDTH 128
-#define OLED_HEIGHT 64
-#define OLED_ADDR 0x3C
-Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+
 
 #define I2S_PORT I2S_NUM_1
 #define SAMPLE_RATE 16000
@@ -128,6 +130,14 @@ bool initCamera() {
 
   return (esp_camera_init(&config) == ESP_OK);
 }
+
+
+void setRGB(uint16_t r, uint16_t g, uint16_t b) {
+  pca.setPWM(LED_R_CH, 0, r);
+  pca.setPWM(LED_G_CH, 0, g);
+  pca.setPWM(LED_B_CH, 0, b);
+}
+
 
 bool initI2S() {
 
@@ -258,17 +268,15 @@ void setup() {
 
   initCamera();
 
-
-  Wire.begin(26,27);
-  Wire.setClock(100000);
-
-
   configTime(3, 0, "pool.ntp.org", "time.nist.gov");
 
   initI2S();
-
-
+  Wire.begin(26,27);
+  Wire.setClock(100000);
   lastMinuteSave = millis();
+  pca.begin();
+  pca.setPWMFreq(1000);
+  setRGB(0,0,0);
 
 }
 
@@ -323,6 +331,9 @@ void loop() {
 
     if (readAHT10(ahtTemp, ahtHum)) {
       Serial.printf("[AHT10] T=%.1fC H=%.1f%%\n", ahtTemp, ahtHum);
+      setRGB(4095,0,0);  // вспышка красным
+      delay(1000);
+      setRGB(0,0,0);
     }
   }
 }
