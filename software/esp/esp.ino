@@ -1,244 +1,272 @@
+#include "esp_camera.h"
 #include <WiFi.h>
-#include <WiFiMulti.h>
-#include <WiFiUDP.h>
-#include <driver/i2s.h>
-#include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <RTClib.h>
-#include <Adafruit_AHTX0.h>
-#include <BH1750.h>
-#include <time.h>
+#include <HTTPClient.h>
+#include "FS.h"
+#include "SD_MMC.h"
+#include "driver/i2s.h"
 
-#define SDA_PIN 33
-#define SCL_PIN 32
-#define OLED_ADDR 0x3C
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+const char* ssid = "Clown";
+const char* password = "12345678";
+const char* serverUrl = "http://10.241.52.96:8080/upload";
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-RTC_DS3231 rtc;
-Adafruit_AHTX0 aht;
-BH1750 lightMeter;
 
-SemaphoreHandle_t i2cMutex;
+unsigned long lastMinuteSave = 0;
+#define SAVE_INTERVAL 60000
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
 
-#define I2S_SD   21
-#define I2S_WS   22
-#define I2S_SCK  26
-#define I2S_PORT I2S_NUM_0
+#define I2S_PORT I2S_NUM_1
+#define SAMPLE_RATE 16000
+#define MIC_WS   15
+#define MIC_DATA 13
+#define MIC_BCLK 2
 
-#define LED_R_PIN 4
-#define LED_G_PIN 16
-#define LED_B_PIN 2
 
-WiFiMulti wifiMulti;
-WiFiUDP udpOut, udpIn;
-const char* udpServerIP = "172.20.10.3";
-const uint16_t udpPortOut = 12345;
-const uint16_t udpPortIn  = 12346;
+#define SOUND_THRESHOLD 1000
+#define REFRACTORY_MS 1000
 
-int16_t sBuffer[1024];
-char udpBuffer[255];
 
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 3 * 3600;
-const int daylightOffset_sec = 0;
+unsigned long lastTrigger = 0;
 
-void micTask(void* parameter) {
-  size_t bytesIn = 0;
+void syncTime() {
+    Serial.println("[NTP] Sync...");
+    configTime(3, 0, "pool.ntp.org", "time.nist.gov");
+    time_t now = time(nullptr);
+    while (now < 100000) {
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+    }
+    Serial.println("\n[NTP] Done");
+}
 
-  i2s_config_t cfg = {
-    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = 16000,
+
+String getDateFolder() {
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  char folder[16];
+  strftime(folder, sizeof(folder), "/%Y-%m-%d", &timeinfo);
+  return String(folder);
+}
+
+
+String getFileName(String folder) {
+  int index = 1;
+  while (true) {
+    char name[32];
+    sprintf(name, "%s/%04d.jpg", folder.c_str(), index);
+    if (!SD_MMC.exists(name))
+      return String(name);
+    index++;
+  }
+}
+
+
+bool initI2S() {
+  i2s_config_t config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 256,
+    .use_apll = false
   };
-  i2s_driver_install(I2S_PORT, &cfg, 0, nullptr);
 
-  i2s_pin_config_t pin_cfg = {
-    .bck_io_num   = I2S_SCK,
-    .ws_io_num    = I2S_WS,
+
+  i2s_pin_config_t pins = {
+    .bck_io_num = MIC_BCLK,
+    .ws_io_num = MIC_WS,
     .data_out_num = -1,
-    .data_in_num  = I2S_SD
+    .data_in_num = MIC_DATA
   };
-  i2s_set_pin(I2S_PORT, &pin_cfg);
-  i2s_start(I2S_PORT);
 
-  udpOut.begin(WiFi.localIP(), udpPortOut);
 
-  while (true) {
-    if (i2s_read(I2S_PORT, sBuffer, sizeof(sBuffer), &bytesIn, portMAX_DELAY) == ESP_OK && bytesIn > 0) {
-      udpOut.beginPacket(udpServerIP, udpPortOut);
-      udpOut.write((uint8_t*)sBuffer, bytesIn);
-      udpOut.endPacket();
-    }
-    delay(10);
-  }
+  if (i2s_driver_install(I2S_PORT, &config, 0, NULL) != ESP_OK)
+    return false;
+
+
+  i2s_set_pin(I2S_PORT, &pins);
+  i2s_zero_dma_buffer(I2S_PORT);
+  return true;
 }
 
-void udpCommandTask(void* parameter) {
-  udpIn.begin(udpPortIn);
-  Serial.printf("[UDP] Listening on port %d\n", udpPortIn);
 
-  while (true) {
-    int len = udpIn.parsePacket();
-    if (len > 0) {
-      int n = udpIn.read(udpBuffer, sizeof(udpBuffer) - 1);
-      if (n > 0) {
-        udpBuffer[n] = '\0';
-        Serial.printf("[UDP] Received: %s\n", udpBuffer);
-
-        int r = 0, g = 0, b = 0;
-        if (sscanf(udpBuffer, "R:%d;G:%d;B:%d", &r, &g, &b) == 3) {
-          r = constrain(r, 0, 255);
-          g = constrain(g, 0, 255);
-          b = constrain(b, 0, 255);
-          analogWrite(LED_R_PIN, r);
-          analogWrite(LED_G_PIN, g);
-          analogWrite(LED_B_PIN, b);
-          Serial.printf("[LED] Set color R:%d G:%d B:%d\n", r, g, b);
-        }
-      }
-    }
-    delay(10);
-  }
+void deinitI2S() {
+  i2s_stop(I2S_PORT);
+  i2s_driver_uninstall(I2S_PORT);
 }
 
-unsigned long lastUpdate = 0;
-void updateDisplay() {
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
-    sensors_event_t humidity, temp;
-    aht.getEvent(&humidity, &temp);
 
-    float lux = lightMeter.readLightLevel();
+bool detectSound() {
+  uint8_t buffer[512];
+  size_t bytesRead;
 
-    time_t nowSecs = time(nullptr);
-    struct tm* timeinfo = localtime(&nowSecs);
 
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
+  if (i2s_read(I2S_PORT, buffer, sizeof(buffer), &bytesRead, 20) != ESP_OK)
+    return false;
 
-    display.setCursor(0, 0);
-    display.printf("Time: %02d:%02d:%02d\n", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-    display.printf("Date: %02d/%02d/%04d\n", timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900);
-    display.printf("Temp: %.1f C\n", temp.temperature);
-    display.printf("Hum:  %.1f %%\n", humidity.relative_humidity);
-    display.printf("Light: %.1f lx", lux);
 
-    display.display();
-    xSemaphoreGive(i2cMutex);
-  }
+  int16_t *samples = (int16_t*)buffer;
+  int count = bytesRead / 2;
+
+
+  long sum = 0;
+  for (int i = 0; i < count; i++)
+    sum += abs(samples[i]);
+
+
+  int rms = sum / count;
+
+
+  return (rms > SOUND_THRESHOLD);
 }
 
-void sensorSendTask(void* parameter) {
-  WiFiUDP udpSensor;
-  udpSensor.begin(WiFi.localIP(), 12347);
+bool initCamera() {
+  camera_config_t config;
 
-  char sensorPayload[128];
 
-  while (true) {
-    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100))) {
-      sensors_event_t humidity, temp;
-      aht.getEvent(&humidity, &temp);
-      float lux = lightMeter.readLightLevel();
-      xSemaphoreGive(i2cMutex);
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
 
-      snprintf(sensorPayload, sizeof(sensorPayload),
-               "TEMP:%.1f;HUM:%.1f;LUX:%.1f",
-               temp.temperature,
-               humidity.relative_humidity,
-               lux);
 
-      udpSensor.beginPacket(udpServerIP, 12347);
-      udpSensor.write((uint8_t*)sensorPayload, strlen(sensorPayload));
-      udpSensor.endPacket();
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
 
-      Serial.printf("[SENSOR] Sent: %s\n", sensorPayload);
-    }
 
-    vTaskDelay(pdMS_TO_TICKS(500));
+  return (esp_camera_init(&config) == ESP_OK);
+}
+
+void saveToSD(camera_fb_t *fb) {
+  if (!SD_MMC.begin()) return;
+
+  String folder = getDateFolder();
+  if (!SD_MMC.exists(folder))
+    SD_MMC.mkdir(folder);
+  String path = getFileName(folder);
+
+  File file = SD_MMC.open(path.c_str(), FILE_WRITE);
+  if (file) {
+    file.write(fb->buf, fb->len);
+    file.close();
+    Serial.println("[SD] Saved: " + path);
   }
+
+
+  SD_MMC.end();
+}
+
+void sendFrame(camera_fb_t *fb) {
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "image/jpeg");
+  http.POST(fb->buf, fb->len);
+  http.end();
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-  i2cMutex = xSemaphoreCreateMutex();
-
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("OLED not found");
-    while (true) delay(10);
-  }
-
-  if (!rtc.begin()) {
-    Serial.println("RTC not found");
-    while (true) delay(10);
-  }
-
-  if (!aht.begin()) {
-    Serial.println("AHT10 not found");
-    while (true) delay(10);
-  }
-
-  if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-    Serial.println("BH1750 not found");
-    while (true) delay(10);
-  }
-
-  delay(200);
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Init OK. Connecting WiFi...");
-  display.display();
-
-  pinMode(LED_R_PIN, OUTPUT);
-  pinMode(LED_G_PIN, OUTPUT);
-  pinMode(LED_B_PIN, OUTPUT);
-
-  wifiMulti.addAP("Cock", "xxxxxxxx");
-  Serial.println("Connecting to WiFi...");
-  while (wifiMulti.run() != WL_CONNECTED) {
+  delay(2000);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
     delay(500);
-    Serial.print(".");
+  initCamera();
+  initI2S();
+  syncTime();
+  lastMinuteSave = millis();
+}
+
+void printMicRaw() {
+  uint8_t buffer[512];
+  size_t bytesRead;
+
+  if (i2s_read(I2S_PORT, buffer, sizeof(buffer), &bytesRead, 10) != ESP_OK)
+    return;
+
+  int16_t *samples = (int16_t*)buffer;
+  int count = bytesRead / 2;
+
+  for (int i = 0; i < count; i++) {
+    Serial.println(samples[i]);
   }
-
-  Serial.println("\n[WiFi] Connected:");
-  Serial.println(WiFi.localIP());
-
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("WiFi OK");
-  display.display();
-
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.println("Waiting for NTP time sync...");
-  struct tm timeinfo;
-  while (!getLocalTime(&timeinfo)) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("\nTime synchronized");
-
-  xTaskCreatePinnedToCore(micTask, "micTask", 8192, nullptr, 1, nullptr, 1);
-  xTaskCreatePinnedToCore(udpCommandTask, "udpCommandTask", 4096, nullptr, 1, nullptr, 1);
-  xTaskCreatePinnedToCore(sensorSendTask, "sensorSendTask", 4096, nullptr, 1, nullptr, 1);
 }
 
 void loop() {
-  if (millis() - lastUpdate > 500) {
-    updateDisplay();
-    lastUpdate = millis();
+
+  unsigned long now = millis();
+  if (now - lastTrigger > REFRACTORY_MS) {
+    if (detectSound()) {
+      lastTrigger = now;
+
+      camera_fb_t * fb = esp_camera_fb_get();
+      if (fb) {
+        deinitI2S();
+        delay(20);
+        saveToSD(fb);
+        initI2S();
+        esp_camera_fb_return(fb);
+      }
+    }
+  }
+
+  static unsigned long lastSend = 0;
+  if (now - lastSend > 200) {
+    lastSend = now;
+
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) {
+      sendFrame(fb);
+      esp_camera_fb_return(fb);
+    }
+  }
+
+  if (now - lastMinuteSave > SAVE_INTERVAL) {
+    lastMinuteSave += SAVE_INTERVAL;
+
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) {
+      deinitI2S();
+      delay(20);
+      saveToSD(fb);
+      initI2S();
+      esp_camera_fb_return(fb);
+    }
   }
 }
