@@ -9,6 +9,10 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_PCF8574.h>
+
+#define PCF8574_ADDRESS 0x20
+#define TOUCH_PIN 0
 
 #define LED_R_CH 0
 #define LED_G_CH 1
@@ -18,9 +22,15 @@
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR 0x3C
 
+
+Adafruit_PCF8574 pcf;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 Adafruit_PWMServoDriver pca(0x40);
+
+int lastTouchState = LOW;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
 
 const char* ssid = "Clown";
 const char* password = "12345678";
@@ -285,6 +295,16 @@ void setup() {
   pca.begin();
   pca.setPWMFreq(1000);
   setRGB(0,0,0);
+    // Инициализация PCF8574
+  if (pcf.begin(PCF8574_ADDRESS, &Wire)) {
+    Serial.println("Adafruit PCF8574 OK на пинах 21 и 22");
+    
+    // Настраиваем пин сенсорной кнопки как вход
+    // В библиотеке Adafruit пины по умолчанию INPUT, но можно явно указать
+    pcf.pinMode(TOUCH_PIN, INPUT_PULLUP); // или просто INPUT, если нет подтяжки
+  } else {
+    Serial.println("Adafruit PCF8574 ERROR");
+  }
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("OLED init failed");
@@ -306,6 +326,12 @@ void loop() {
   unsigned long now = millis();
 
   if (now - lastTrigger > REFRACTORY_MS) {
+    int reading = pcf.digitalRead(TOUCH_PIN);
+    if (reading == HIGH) {
+      setRGB(4095,0,0);
+    } else {
+      setRGB(0,0,0);
+    }
     if (detectSound()) {
 
 
