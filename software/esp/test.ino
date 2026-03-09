@@ -1,22 +1,59 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include "FS.h"
 #include "SD_MMC.h"
 #include "driver/i2s.h"
 #include "time.h"
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_PCF8574.h>
+#include <Ticker.h>
+
+#define PCF8574_ADDRESS 0x20
+#define TOUCH_PIN 0
+#define DEBOUNCE_DELAY 50
+#define BUTTON_UPDATE_INTERVAL 10
 
 #define LED_R_CH 0
 #define LED_G_CH 1
 #define LED_B_CH 2
 
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+
+Adafruit_PCF8574 pcf;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Adafruit_PWMServoDriver pca(0x40);
+
+Ticker buttonTicker;
+volatile bool checkButtonFlag = false;
+
+
+bool streaming = false;
+unsigned long lastFrame = 0;
+const int FRAME_INTERVAL = 10; // ~10 FPS
+
+void IRAM_ATTR onButtonTimer() {
+    checkButtonFlag = true;
+}
+
+WebSocketsClient ws;
+
 
 const char* ssid = "Clown";
 const char* password = "12345678";
-const char* serverUrl = "http://10.241.52.96:8080/upload";
+
+
+const char* ws_host = "10.241.52.96";
+const uint16_t ws_port = 8080;
+const char* ws_path = "/ws";
+
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -36,7 +73,6 @@ const char* serverUrl = "http://10.241.52.96:8080/upload";
 #define PCLK_GPIO_NUM     22
 
 
-
 #define I2S_PORT I2S_NUM_1
 #define SAMPLE_RATE 16000
 #define MIC_WS   15
@@ -49,17 +85,15 @@ const char* serverUrl = "http://10.241.52.96:8080/upload";
 
 
 unsigned long lastTrigger = 0;
-unsigned long lastMinuteSave = 0;
 unsigned long lastSensorUpdate = 0;
-unsigned long lastSend = 0;
 
 
-#define SAVE_INTERVAL 60000
 #define SENSOR_INTERVAL 60000
 
 
 float ahtTemp = 0;
 float ahtHum = 0;
+
 
 bool readAHT10(float &temperature, float &humidity) {
 
@@ -93,6 +127,7 @@ bool readAHT10(float &temperature, float &humidity) {
   return true;
 }
 
+
 bool initCamera() {
 
 
@@ -123,9 +158,7 @@ bool initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
-  config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.fb_count = 1;
 
 
   return (esp_camera_init(&config) == ESP_OK);
@@ -150,8 +183,7 @@ bool initI2S() {
     .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 4,
-    .dma_buf_len = 256,
-    .use_apll = false
+    .dma_buf_len = 256
   };
 
 
@@ -172,12 +204,6 @@ bool initI2S() {
 
 
   return true;
-}
-
-
-void deinitI2S() {
-  i2s_stop(I2S_PORT);
-  i2s_driver_uninstall(I2S_PORT);
 }
 
 
@@ -207,53 +233,77 @@ bool detectSound() {
   return (rms > SOUND_THRESHOLD);
 }
 
-String getDateFolder() {
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-  char folder[16];
-  strftime(folder, sizeof(folder), "/%Y-%m-%d", &timeinfo);
-  return String(folder);
+
+void sendPhoto() {
+
+
+  camera_fb_t * fb = esp_camera_fb_get();
+
+
+  if (!fb) return;
+
+
+  ws.sendBIN(fb->buf, fb->len);
+
+
+  esp_camera_fb_return(fb);
 }
 
 
-String getFileName(String folder) {
-  int index = 1;
-  while (true) {
-    char name[32];
-    sprintf(name, "%s/%04d.jpg", folder.c_str(), index);
-    if (!SD_MMC.exists(name))
-      return String(name);
-    index++;
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+
+
+  if(type == WStype_TEXT) {
+
+
+    String cmd = String((char*)payload);
+
+
+if(cmd == "stream_on"){
+    streaming = true;
+}
+
+else if(cmd == "stream_off"){
+    streaming = false;
+}
+
+else if(cmd == "photo"){
+    sendPhoto();
+}
+
+
+    else if(cmd == "get_sensors") {
+
+
+      char msg[64];
+      sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum);
+      ws.sendTXT(msg);
+
+
+    }
+
+
+    else if(cmd.startsWith("rgb")) {
+
+
+      int r,g,b;
+      sscanf(cmd.c_str(),"rgb %d %d %d",&r,&g,&b);
+      setRGB(r,g,b);
+
+
+    }
+
+
+    else if(cmd == "reboot") {
+
+
+      ESP.restart();
+
+
+    }
   }
 }
 
-
-void saveToSD(camera_fb_t *fb) {
-  if (!SD_MMC.begin()) return;
-
-  String folder = getDateFolder();
-  if (!SD_MMC.exists(folder))
-    SD_MMC.mkdir(folder);
-  String path = getFileName(folder);
-
-  File file = SD_MMC.open(path.c_str(), FILE_WRITE);
-  if (file) {
-    file.write(fb->buf, fb->len);
-    file.close();
-    Serial.println("[SD] Saved: " + path);
-  }
-
-
-  SD_MMC.end();
-}
-
-void sendFrame(camera_fb_t *fb) {
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "image/jpeg");
-  http.POST(fb->buf, fb->len);
-  http.end();
-}
 
 void setup() {
 
@@ -261,79 +311,114 @@ void setup() {
   Serial.begin(115200);
 
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED)
+  WiFi.begin(ssid,password);
+
+
+  while(WiFi.status()!=WL_CONNECTED)
     delay(500);
 
-
   initCamera();
-
-  configTime(3, 0, "pool.ntp.org", "time.nist.gov");
-
+  Wire.begin(26,27);
   initI2S();
+
   Wire.begin(26,27);
   Wire.setClock(100000);
-  lastMinuteSave = millis();
   pca.begin();
   pca.setPWMFreq(1000);
   setRGB(0,0,0);
+  if (pcf.begin(PCF8574_ADDRESS, &Wire)) {
+    Serial.println("Adafruit PCF8574 OK на пинах 21 и 22");
+  
+    pcf.pinMode(TOUCH_PIN, INPUT_PULLUP); 
+  } else {
+    Serial.println("Adafruit PCF8574 ERROR");
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed");
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("System OK");
+  display.display();
+
+
+
+  ws.begin(ws_host,ws_port,ws_path);
+  ws.onEvent(webSocketEvent);
+  ws.setReconnectInterval(2000);
+  buttonTicker.attach_ms(20, onButtonTimer);
 
 }
+
 
 void loop() {
 
 
+  ws.loop();
+
+
   unsigned long now = millis();
 
-  if (now - lastTrigger > REFRACTORY_MS) {
-    if (detectSound()) {
+    // Проверка по флагу от таймера (быстрее чем в основном цикле)
+    if (checkButtonFlag) {
+        checkButtonFlag = false;
+        
+        static int lastButtonState = HIGH;
+        static unsigned long lastDebounceTime = 0;
+        
+        int reading = pcf.digitalRead(TOUCH_PIN);
+        
+        if (reading != lastButtonState) {
+            lastDebounceTime = now;
+        }
+        
+        if ((now - lastDebounceTime) > DEBOUNCE_DELAY) {
+            static int buttonState = HIGH;
+            static bool lastSentState = false;
+            
+            if (reading != buttonState) {
+                buttonState = reading;
+                
+                if (buttonState == HIGH) {
+                    setRGB(4095, 0, 0);
+                    lastSentState = true;
+                } else {
+                    setRGB(0, 0, 0);
+                    lastSentState = false;
+                }
+            }
+        }
+        
+        lastButtonState = reading;
+    }
+
+  if(now-lastTrigger>REFRACTORY_MS) {
 
 
-      lastTrigger = now;
-
-
-      camera_fb_t * fb = esp_camera_fb_get();
-      if (fb) {
-        deinitI2S();
-        saveToSD(fb);
-        initI2S();
-        esp_camera_fb_return(fb);
-      }
+    if(detectSound()) {
+      lastTrigger=now;
+      ws.sendTXT("sound");
     }
   }
 
-  if (now - lastSend > 200) {
-    lastSend = now;
 
+  if(now-lastSensorUpdate>SENSOR_INTERVAL) {
 
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (fb) {
-      sendFrame(fb);
-      esp_camera_fb_return(fb);
+    lastSensorUpdate=now;
+
+    if(readAHT10(ahtTemp,ahtHum)) {
+      char msg[64];
+      sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum);
+      ws.sendTXT(msg);
     }
   }
-
-  if (now - lastMinuteSave > SAVE_INTERVAL) {
-    lastMinuteSave += SAVE_INTERVAL;
-
-
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (fb) {
-      deinitI2S();
-      saveToSD(fb);
-      initI2S();
-      esp_camera_fb_return(fb);
-    }
-  }
-
-  if (now - lastSensorUpdate > SENSOR_INTERVAL) {
-    lastSensorUpdate += SENSOR_INTERVAL;
-
-    if (readAHT10(ahtTemp, ahtHum)) {
-      Serial.printf("[AHT10] T=%.1fC H=%.1f%%\n", ahtTemp, ahtHum);
-      setRGB(4095,0,0);  // вспышка красным
-      delay(1000);
-      setRGB(0,0,0);
-    }
-  }
+if(streaming && millis() - lastFrame > FRAME_INTERVAL){
+    lastFrame = millis();
+    sendPhoto();
+}
 }
