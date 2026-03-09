@@ -41,7 +41,7 @@ volatile bool checkButtonFlag = false;
 
 bool streaming = false;
 unsigned long lastFrame = 0;
-const int FRAME_INTERVAL = 10; // ~10 FPS
+const int FRAME_INTERVAL = 10; 
 
 void IRAM_ATTR onButtonTimer() {
     checkButtonFlag = true;
@@ -101,11 +101,9 @@ float ahtHum = 0;
 void soundTask(void *pvParameters) {
     while (1) {
         if (detectSound()) {
-            // Отправляем сигнал в основную задачу (просто число, например 1)
             int evt = 1;
             xQueueSend(soundEventQueue, &evt, 0);
         }
-        // Небольшая задержка для экономии ресурсов (можно подобрать)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -336,15 +334,15 @@ void setup() {
   initCamera();
   Wire.begin(26,27);
   initI2S();
-soundEventQueue = xQueueCreate(5, sizeof(int)); // очередь на 5 элементов
+soundEventQueue = xQueueCreate(5, sizeof(int)); 
 xTaskCreatePinnedToCore(
-    soundTask,      // функция задачи
-    "SoundTask",    // имя
-    4096,           // размер стека
-    NULL,           // параметры
-    1,              // приоритет (меньше, чем у основной задачи)
+    soundTask,      
+    "SoundTask",    
+    4096,          
+    NULL,   
+    1,             
     &soundTaskHandle,
-    0               // ядро 0 (обычно для фоновых задач)
+    0          
 );
   Wire.begin(26,27);
   Wire.setClock(100000);
@@ -389,7 +387,6 @@ void loop() {
 
   unsigned long now = millis();
 
-    // Проверка по флагу от таймера (быстрее чем в основном цикле)
     if (checkButtonFlag) {
         checkButtonFlag = false;
         
