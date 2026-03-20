@@ -11,6 +11,8 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_PCF8574.h>
 #include <Ticker.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #define PCF8574_ADDRESS 0x20
 #define TOUCH_PIN 0
@@ -25,6 +27,13 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR 0x3C
+
+unsigned long lastI2SInit =0;
+volatile bool fl = 0;
+xSemaphoreHandle cameraMutex;           // мьютекс для доступа к камере
+xSemaphoreHandle i2sMutex;              // мьютекс для доступа к I2S
+unsigned long lastSDPhoto = 0;           // время последнего сохранения на SD
+const unsigned long SD_PHOTO_INTERVAL = 30000; // интервал 1 минута
 
 
 Adafruit_PCF8574 pcf;
@@ -54,7 +63,7 @@ const char* ssid = "Clown";
 const char* password = "12345678";
 
 
-const char* ws_host = "10.241.52.96";
+const char* ws_host = "10.167.23.96";
 const uint16_t ws_port = 8080;
 const char* ws_path = "/ws";
 
@@ -100,14 +109,17 @@ float ahtHum = 0;
 
 void soundTask(void *pvParameters) {
     while (1) {
-        if (detectSound()) {
-            int evt = 1;
-            xQueueSend(soundEventQueue, &evt, 0);
+        if (millis() - lastI2SInit > 1000)
+        {
+            if (detectSound()&&(fl!=1)) {
+                        int evt = 1;
+                        xQueueSend(soundEventQueue, &evt, 0);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        
     }
 }
-
 
 bool readAHT10(float &temperature, float &humidity) {
 
@@ -187,82 +199,156 @@ void setRGB(uint16_t r, uint16_t g, uint16_t b) {
 
 
 bool initI2S() {
+    esp_err_t err = i2s_driver_uninstall(I2S_PORT);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        Serial.println("I2S uninstall failed");
+        return false;
+    }
 
+    i2s_config_t config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256
+    };
 
-  i2s_config_t config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 256
-  };
+    i2s_pin_config_t pins = {
+        .bck_io_num = MIC_BCLK,
+        .ws_io_num = MIC_WS,
+        .data_out_num = -1,
+        .data_in_num = MIC_DATA
+    };
 
+    if (i2s_driver_install(I2S_PORT, &config, 0, NULL) != ESP_OK)
+        return false;
 
-  i2s_pin_config_t pins = {
-    .bck_io_num = MIC_BCLK,
-    .ws_io_num = MIC_WS,
-    .data_out_num = -1,
-    .data_in_num = MIC_DATA
-  };
+    if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK)
+        return false;
 
-
-  if (i2s_driver_install(I2S_PORT, &config, 0, NULL) != ESP_OK)
-    return false;
-
-
-  i2s_set_pin(I2S_PORT, &pins);
-  i2s_zero_dma_buffer(I2S_PORT);
-
-
-  return true;
+    i2s_zero_dma_buffer(I2S_PORT);
+    delay(50);
+    lastI2SInit = millis();
+    return true;
 }
 
 
+void savePhotoToSD() {
+
+    xSemaphoreTake(i2sMutex, portMAX_DELAY);
+    esp_err_t err = i2s_driver_uninstall(I2S_PORT);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        Serial.println("I2S uninstall error");
+    }
+    delay(10);
+    fl = 1;
+    if (!SD_MMC.begin()) {
+        Serial.println("SD Card Mount Failed");
+        // Возвращаем I2S обратно
+        initI2S();
+        xSemaphoreGive(i2sMutex);
+        return;
+    }
+
+    if (SD_MMC.cardType() == CARD_NONE) {
+        Serial.println("No SD card attached");
+        SD_MMC.end();
+        initI2S();
+        xSemaphoreGive(i2sMutex);
+        return;
+    }
+    if (xSemaphoreTake(cameraMutex, portMAX_DELAY) != pdTRUE) {
+        SD_MMC.end();
+        initI2S();
+        xSemaphoreGive(i2sMutex);
+        return;
+    }
+
+    delay(50);
+
+    camera_fb_t *fb = NULL;
+
+    fb = esp_camera_fb_get();
+
+    if (!fb) {
+        Serial.println("Camera capture failed after retries");
+        xSemaphoreGive(cameraMutex);
+        SD_MMC.end();
+        initI2S();
+        xSemaphoreGive(i2sMutex);
+        fl = 0;
+        return;
+    }
+
+    char filename[32];
+    time_t now = time(nullptr);
+    if (now < 8 * 3600 * 2) { 
+        sprintf(filename, "/photo_%lu.jpg", millis());
+    } else {
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        strftime(filename, sizeof(filename), "/photo_%Y%m%d_%H%M%S.jpg", &timeinfo);
+    }
+
+    File file = SD_MMC.open(filename, FILE_WRITE);
+    if (!file) {
+        Serial.println("Failed to create file");
+    } else {
+        file.write(fb->buf, fb->len);
+        file.close();
+        Serial.printf("Saved photo: %s\n", filename);
+    }
+    esp_camera_fb_return(fb);
+    xSemaphoreGive(cameraMutex);
+
+    SD_MMC.end();
+
+    if (!initI2S()) {
+        Serial.println("I2S reinit failed");
+    }
+    xSemaphoreGive(i2sMutex);
+    fl =0;
+}
+
 bool detectSound() {
+    if (xSemaphoreTake(i2sMutex, portMAX_DELAY) != pdTRUE) {
+        return false; 
+    }
 
+    uint8_t buffer[512];
+    size_t bytesRead;
+    esp_err_t res = i2s_read(I2S_PORT, buffer, sizeof(buffer), &bytesRead, 20);
 
-  uint8_t buffer[512];
-  size_t bytesRead;
+    xSemaphoreGive(i2sMutex);
 
+    if (res != ESP_OK) return false;
 
-  if (i2s_read(I2S_PORT, buffer, sizeof(buffer), &bytesRead, 20) != ESP_OK)
-    return false;
+    int16_t *samples = (int16_t*)buffer;
+    int count = bytesRead / 2;
+    long sum = 0;
+    for (int i = 0; i < count; i++)
+        sum += abs(samples[i]);
 
-
-  int16_t *samples = (int16_t*)buffer;
-  int count = bytesRead / 2;
-
-
-  long sum = 0;
-  for (int i = 0; i < count; i++)
-    sum += abs(samples[i]);
-
-
-  int rms = sum / count;
-
-
-  return (rms > SOUND_THRESHOLD);
+    int rms = sum / count;
+    return (rms > SOUND_THRESHOLD);
 }
 
 
 void sendPhoto() {
-
-
-  camera_fb_t * fb = esp_camera_fb_get();
-
-
-  if (!fb) return;
-
-
-  ws.sendBIN(fb->buf, fb->len);
-
-
-  esp_camera_fb_return(fb);
+    if (xSemaphoreTake(cameraMutex, portMAX_DELAY) == pdTRUE) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            ws.sendBIN(fb->buf, fb->len);
+            esp_camera_fb_return(fb);
+        } else {
+            Serial.println("sendPhoto: camera capture failed");
+        }
+        xSemaphoreGive(cameraMutex);
+    }
 }
-
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
@@ -332,6 +418,9 @@ void setup() {
     delay(500);
 
   initCamera();
+  cameraMutex = xSemaphoreCreateMutex();
+  i2sMutex = xSemaphoreCreateMutex();
+
   Wire.begin(26,27);
   initI2S();
 soundEventQueue = xQueueCreate(5, sizeof(int)); 
@@ -369,12 +458,26 @@ xTaskCreatePinnedToCore(
   display.println("System OK");
   display.display();
 
-
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.println("Waiting for NTP time sync...");
+    time_t now = time(nullptr);
+    int timeout = 0;
+    while (now < 8 * 3600 * 2 && timeout < 20) { 
+        delay(500);
+        now = time(nullptr);
+        timeout++;
+    }
+    if (now >= 8 * 3600 * 2)
+        Serial.println("Time synchronized");
+    else
+        Serial.println("Time sync failed, using millis() for filenames");
 
   ws.begin(ws_host,ws_port,ws_path);
   ws.onEvent(webSocketEvent);
   ws.setReconnectInterval(2000);
   buttonTicker.attach_ms(20, onButtonTimer);
+
+  
 
 }
 
@@ -426,7 +529,10 @@ void loop() {
             ws.sendTXT("sound");
         }
     }
-
+    if (now - lastSDPhoto >= SD_PHOTO_INTERVAL) {
+        lastSDPhoto = now;
+        savePhotoToSD();
+    }
 
   if(now-lastSensorUpdate>SENSOR_INTERVAL) {
 
@@ -434,12 +540,12 @@ void loop() {
 
     if(readAHT10(ahtTemp,ahtHum)) {
       char msg[64];
-      sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum);
+      sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum    );
       ws.sendTXT(msg);
     }
   }
-if(streaming && millis() - lastFrame > FRAME_INTERVAL){
-    lastFrame = millis();
-    sendPhoto();
-}
+    if (streaming && (now - lastFrame > FRAME_INTERVAL)) {
+        lastFrame = now;
+        sendPhoto();
+    }
 }
