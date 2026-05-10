@@ -13,68 +13,20 @@
 #include <Ticker.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <GyverBME280.h>
 
+// ==================== I2C DEVICES ====================
 #define PCF8574_ADDRESS 0x20
-#define TOUCH_PIN 0
-#define DEBOUNCE_DELAY 50
-#define BUTTON_UPDATE_INTERVAL 10
+#define OLED_ADDR 0x3C
+#define AHT10_ADDR 0x38
+#define BME280_ADDR 0x76
+#define PCA9685_ADDR 0x40
 
+// ==================== PIN DEFINITIONS ====================
+#define TOUCH_PIN 0
 #define LED_R_CH 0
 #define LED_G_CH 1
 #define LED_B_CH 2
-
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
-
-unsigned long lastI2SInit =0;
-volatile bool fl = 0;
-xSemaphoreHandle cameraMutex;          
-xSemaphoreHandle i2sMutex;            
-unsigned long lastSDPhoto = 0;        
-const unsigned long SD_PHOTO_INTERVAL = 30000;
-bool audioStreaming = false;
-
-#define AUDIO_SAMPLES 2048                 
-#define AUDIO_BYTES (AUDIO_SAMPLES * 2)   
-uint8_t audioBuf[AUDIO_BYTES];
-
-Adafruit_PCF8574 pcf;
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-Adafruit_PWMServoDriver pca(0x40);
-
-QueueHandle_t soundEventQueue = nullptr;
-TaskHandle_t soundTaskHandle = nullptr;
-
-// NEW: очередь для передачи аудиоданных из звуковой задачи в главный цикл
-QueueHandle_t audioQueue = nullptr;
-typedef struct {
-    uint8_t* data;
-    size_t len;
-} audio_packet_t;
-
-// NEW: рекурсивный мьютекс для WebSocket
-SemaphoreHandle_t wsMutex = nullptr;
-
-Ticker buttonTicker;
-volatile bool checkButtonFlag = false;
-
-bool streaming = false;
-unsigned long lastFrame = 0;
-const int FRAME_INTERVAL = 10; 
-
-void IRAM_ATTR onButtonTimer() {
-    checkButtonFlag = true;
-}
-
-WebSocketsClient ws;
-
-const char* ssid = "Clown";
-const char* password = "12345678";
-
-const char* ws_host = "10.14.63.96";
-const uint16_t ws_port = 8080;
-const char* ws_path = "/ws";
 
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
@@ -96,23 +48,88 @@ const char* ws_path = "/ws";
 #define PCLK_GPIO_NUM 13
 
 #define I2S_PORT I2S_NUM_1
-#define SAMPLE_RATE 16000
 #define MIC_WS   14
 #define MIC_DATA 42
 #define MIC_BCLK 41
 
+// ==================== TIMING CONSTANTS ====================
+#define SAMPLE_RATE 16000
 #define SOUND_THRESHOLD 1000
 #define REFRACTORY_MS 1000
 
-unsigned long lastTrigger = 0;
-unsigned long lastSensorUpdate = 0;
+#define DEBOUNCE_DELAY 50
+#define BUTTON_UPDATE_INTERVAL 10
+#define SD_PHOTO_INTERVAL 30000
+#define FRAME_INTERVAL 10
 
 #define SENSOR_INTERVAL 60000
+#define DISPLAY_UPDATE_INTERVAL 1000
 
-float ahtTemp = 0;
-float ahtHum = 0;
+// ==================== OLED ====================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 
-// Прототипы функций
+// ==================== AUDIO ====================
+#define AUDIO_SAMPLES 2048                 
+#define AUDIO_BYTES (AUDIO_SAMPLES * 2)   
+
+// ==================== GLOBAL OBJECTS ====================
+Adafruit_PCF8574 pcf;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_PWMServoDriver pca(PCA9685_ADDR);
+GyverBME280 bme;
+
+// ==================== AUDIO BUFFER ====================
+uint8_t audioBuf[AUDIO_BYTES];
+
+// ==================== RTOS OBJECTS ====================
+xSemaphoreHandle cameraMutex = nullptr;          
+xSemaphoreHandle i2sMutex = nullptr;            
+SemaphoreHandle_t wsMutex = nullptr;
+QueueHandle_t soundEventQueue = nullptr;
+QueueHandle_t audioQueue = nullptr;
+TaskHandle_t soundTaskHandle = nullptr;
+
+typedef struct {
+    uint8_t* data;
+    size_t len;
+} audio_packet_t;
+
+// ==================== TIMERS ====================
+Ticker buttonTicker;
+volatile bool checkButtonFlag = false;
+
+// ==================== STATE VARIABLES ====================
+bool streaming = false;
+bool audioStreaming = false;
+bool bmeInitialized = false;
+bool ahtInitialized = false;
+
+unsigned long lastI2SInit = 0;
+unsigned long lastSDPhoto = 0;        
+unsigned long lastFrame = 0;
+unsigned long lastTrigger = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastDisplayUpdate = 0;
+
+volatile bool fl = 0;
+
+// ==================== SENSOR DATA ====================
+float currentTemp = 0;
+float currentHum = 0;
+float currentPressure = 0;
+
+// ==================== WEBSOCKET ====================
+WebSocketsClient ws;
+
+const char* ssid = "Clown";
+const char* password = "12345678";
+
+const char* ws_host = "10.122.132.96";
+const uint16_t ws_port = 8080;
+const char* ws_path = "/ws";
+
+// ==================== FUNCTION PROTOTYPES ====================
 bool initCamera();
 void setRGB(uint16_t r, uint16_t g, uint16_t b);
 bool initI2S();
@@ -121,18 +138,57 @@ bool detectSound();
 void sendPhoto();
 void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len);
 void sendAudio();
+void updateDisplay();
+bool initBME280();
+bool initAHT10();
+bool readAHT10(float &temperature, float &humidity);
+void readSensors(float &temperature, float &humidity, float &pressure);
+const char* getDayOfWeek(int wday);
 
-void soundTask(void *pvParameters) {
-    while (1) {
-        if (millis() - lastI2SInit > 1000) {
-            sendAudio();
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+// ==================== INTERRUPT HANDLER ====================
+void IRAM_ATTR onButtonTimer() {
+    checkButtonFlag = true;
+}
+
+// ==================== HELPER FUNCTIONS ====================
+const char* getDayOfWeek(int wday) {
+    switch(wday) {
+        case 0: return "Sun";
+        case 1: return "Mon";
+        case 2: return "Tue";
+        case 3: return "Wed";
+        case 4: return "Thu";
+        case 5: return "Fri";
+        case 6: return "Sat";
+        default: return "???";
     }
 }
 
+// ==================== AHT10 CUSTOM DRIVER ====================
+bool initAHT10() {
+    Wire.beginTransmission(AHT10_ADDR);
+    Wire.write(0xE1);
+    Wire.write(0x08);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("AHT10 init failed");
+        return false;
+    }
+    
+    delay(500);
+    
+    Wire.beginTransmission(AHT10_ADDR);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("AHT10 not responding after init");
+        return false;
+    }
+    
+    Serial.println("AHT10 initialized successfully");
+    return true;
+}
+
 bool readAHT10(float &temperature, float &humidity) {
-    Wire.beginTransmission(0x38);
+    Wire.beginTransmission(AHT10_ADDR);
     Wire.write(0xAC);
     Wire.write(0x33);
     Wire.write(0x00);
@@ -140,11 +196,16 @@ bool readAHT10(float &temperature, float &humidity) {
 
     delay(80);
 
-    Wire.requestFrom(0x38, 6);
+    Wire.requestFrom(AHT10_ADDR, 6);
     if (Wire.available() != 6) return false;
 
     uint8_t data[6];
     for (int i = 0; i < 6; i++) data[i] = Wire.read();
+
+    if (data[0] & 0x80) {
+        Serial.println("AHT10: Sensor busy");
+        return false;
+    }
 
     uint32_t rawHum = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
     uint32_t rawTemp = ((uint32_t)(data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
@@ -154,6 +215,96 @@ bool readAHT10(float &temperature, float &humidity) {
     return true;
 }
 
+// ==================== BME280/BMP280 DRIVER ====================
+bool initBME280() {
+    if (!bme.begin(BME280_ADDR)) {
+        Serial.println("BME280/BMP280 not found");
+        return false;
+    }
+    
+    Serial.println("BME280/BMP280 initialized for pressure");
+    return true;
+}
+
+// ==================== COMBINED SENSOR READING ====================
+void readSensors(float &temperature, float &humidity, float &pressure) {
+    temperature = humidity = pressure = 0;
+    
+    if (ahtInitialized) {
+        if (!readAHT10(temperature, humidity)) {
+            Serial.println("Failed to read AHT10");
+            temperature = humidity = 0;
+        }
+    }
+    
+    if (bmeInitialized) {
+        float pressurePa = bme.readPressure();
+        pressure = pressureToMmHg(pressurePa);
+    }
+}
+
+// ==================== OLED DISPLAY ====================
+void updateDisplay() {
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    
+    // Time
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    char timeStr[9];
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+    display.print(timeStr);
+    
+    // Seconds
+    display.setTextSize(1);
+    display.setCursor(80, 8);
+    char secStr[3];
+    strftime(secStr, sizeof(secStr), "%S", &timeinfo);
+    display.print(secStr);
+    
+    // Date
+    display.setTextSize(1);
+    display.setCursor(0, 18);
+    char dateStr[20];
+    strftime(dateStr, sizeof(dateStr), "%d.%m.%Y", &timeinfo);
+    display.printf("%s %s", dateStr, getDayOfWeek(timeinfo.tm_wday));
+    
+    // Divider
+    display.drawLine(0, 27, 128, 27, SSD1306_WHITE);
+    
+    // Sensor Data
+    if (ahtInitialized || bmeInitialized) {
+        float temp, hum, pres;
+        readSensors(temp, hum, pres);
+        
+        display.setCursor(0, 32);
+        display.printf("T: %.1f", temp);
+        display.print("C");
+        
+        display.setCursor(64, 32);
+        display.printf("H: %.1f%%", hum);
+        
+        display.setCursor(0, 48);
+        if (bmeInitialized) {
+            display.printf("P: %.1f mmHg", pres);
+        } else {
+            display.print("P: --- mmHg");
+        }
+    } else {
+        display.setCursor(10, 40);
+        display.setTextSize(2);
+        display.println("NO SENSORS");
+    }
+    
+    display.display();
+}
+
+// ==================== CAMERA ====================
 bool initCamera() {
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
@@ -184,12 +335,14 @@ bool initCamera() {
     return (esp_camera_init(&config) == ESP_OK);
 }
 
+// ==================== RGB LED ====================
 void setRGB(uint16_t r, uint16_t g, uint16_t b) {
     pca.setPWM(LED_R_CH, 0, r);
     pca.setPWM(LED_G_CH, 0, g);
     pca.setPWM(LED_B_CH, 0, b);
 }
 
+// ==================== I2S AUDIO ====================
 bool initI2S() {
     esp_err_t err = i2s_driver_uninstall(I2S_PORT);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -227,6 +380,7 @@ bool initI2S() {
     return true;
 }
 
+// ==================== SD CARD PHOTO ====================
 void savePhotoToSD() {
     xSemaphoreTake(i2sMutex, portMAX_DELAY);
     esp_err_t err = i2s_driver_uninstall(I2S_PORT);
@@ -263,7 +417,7 @@ void savePhotoToSD() {
     fb = esp_camera_fb_get();
 
     if (!fb) {
-        Serial.println("Camera capture failed after retries");
+        Serial.println("Camera capture failed");
         xSemaphoreGive(cameraMutex);
         SD_MMC.end();
         initI2S();
@@ -302,6 +456,7 @@ void savePhotoToSD() {
     fl = 0;
 }
 
+// ==================== SOUND DETECTION ====================
 bool detectSound() {
     if (xSemaphoreTake(i2sMutex, portMAX_DELAY) != pdTRUE) {
         return false; 
@@ -325,7 +480,7 @@ bool detectSound() {
     return (rms > SOUND_THRESHOLD);
 }
 
-// NEW: отправка бинарного пакета с защитой мьютексом
+// ==================== NETWORK SEND ====================
 void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len){
     uint8_t* packet = (uint8_t*)malloc(4 + len);
     if(!packet) return;
@@ -337,7 +492,6 @@ void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len){
 
     memcpy(packet + 4, data, len);
     
-    // Защита WebSocket
     xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
     ws.sendBIN(packet, 4 + len);
     xSemaphoreGiveRecursive(wsMutex);
@@ -366,7 +520,6 @@ void sendAudio(){
         if (packetData) {
             memcpy(packetData, audioBuf, bytesRead);
             audio_packet_t packet = { packetData, bytesRead };
-            // Если очередь полна, освобождаем буфер
             if (xQueueSend(audioQueue, &packet, 0) != pdTRUE) {
                 free(packetData);
             }
@@ -375,6 +528,7 @@ void sendAudio(){
     xSemaphoreGive(i2sMutex);
 }
 
+// ==================== WEBSOCKET EVENTS ====================
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     if(type == WStype_TEXT) {
         String cmd = String((char*)payload);
@@ -389,8 +543,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         }
         else if(cmd == "get_sensors") {
             char msg[64];
-            sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum);
-            // Защита WebSocket
+            sprintf(msg,"temp:%.1f hum:%.1f pres:%.1f",currentTemp,currentHum,currentPressure);
             xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
             ws.sendTXT(msg);
             xSemaphoreGiveRecursive(wsMutex);
@@ -408,6 +561,17 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     }
 }
 
+// ==================== AUDIO TASK ====================
+void soundTask(void *pvParameters) {
+    while (1) {
+        if (millis() - lastI2SInit > 1000) {
+            sendAudio();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+// ==================== SETUP ====================
 void setup() {
     Serial.begin(115200);
 
@@ -424,13 +588,11 @@ void setup() {
     initI2S();
 
     soundEventQueue = xQueueCreate(5, sizeof(int)); 
-    // NEW: создаём очередь для аудиопакетов (увеличена до 20)
     audioQueue = xQueueCreate(20, sizeof(audio_packet_t));
     if (audioQueue == NULL) {
         Serial.println("Failed to create audio queue");
     }
     
-    // NEW: создаём рекурсивный мьютекс для WebSocket
     wsMutex = xSemaphoreCreateRecursiveMutex();
     if (wsMutex == NULL) {
         Serial.println("Failed to create wsMutex");
@@ -452,7 +614,7 @@ void setup() {
     pca.setPWMFreq(1000);
     setRGB(0,0,0);
     if (pcf.begin(PCF8574_ADDRESS, &Wire)) {
-        Serial.println("Adafruit PCF8574 OK на пинах 21 и 22");
+        Serial.println("Adafruit PCF8574 OK");
         pcf.pinMode(TOUCH_PIN, INPUT_PULLUP); 
     } else {
         Serial.println("Adafruit PCF8574 ERROR");
@@ -466,9 +628,10 @@ void setup() {
     display.clearDisplay();
     display.setTextSize(2);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
+    display.setCursor(10,20);
     display.println("System OK");
     display.display();
+    delay(1000);
 
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     Serial.println("Waiting for NTP time sync...");
@@ -484,19 +647,30 @@ void setup() {
     else
         Serial.println("Time sync failed, using millis() for filenames");
 
+    ahtInitialized = initAHT10();
+    if (!ahtInitialized) {
+        Serial.println("Warning: AHT10 not found");
+    }
+    
+    bmeInitialized = initBME280();
+    if (!bmeInitialized) {
+        Serial.println("Warning: BME280/BMP280 not found");
+    }
+
     ws.begin(ws_host,ws_port,ws_path);
     ws.onEvent(webSocketEvent);
     ws.setReconnectInterval(2000);
     buttonTicker.attach_ms(20, onButtonTimer);
+    
+    updateDisplay();
 }
 
+// ==================== MAIN LOOP ====================
 void loop() {
-    // Защищённый вызов ws.loop
     xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
     ws.loop();
     xSemaphoreGiveRecursive(wsMutex);
     
-    // Обработка очереди аудио (без мьютекса, т.к. отправка внутри sendBinaryPacket защищена)
     audio_packet_t packet;
     while (xQueueReceive(audioQueue, &packet, 0) == pdTRUE) {
         sendBinaryPacket(2, packet.data, packet.len);
@@ -505,6 +679,7 @@ void loop() {
 
     unsigned long now = millis();
 
+    // ==================== TOUCH BUTTON HANDLER ====================
     if (checkButtonFlag) {
         checkButtonFlag = false;
         
@@ -537,33 +712,47 @@ void loop() {
         lastButtonState = reading;
     }
 
+    // ==================== SOUND EVENT HANDLER ====================
     int soundEvent;
     if (xQueueReceive(soundEventQueue, &soundEvent, 0) == pdTRUE) {
         if (millis() - lastTrigger > REFRACTORY_MS) {
             lastTrigger = millis();
-            // Защищённая отправка
             xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
             ws.sendTXT("sound");
             xSemaphoreGiveRecursive(wsMutex);
         }
     }
 
-    if ((now - lastSDPhoto >= SD_PHOTO_INTERVAL)&&(!streaming)) {
+    // ==================== SD CARD TIMER ====================
+    if ((now - lastSDPhoto >= SD_PHOTO_INTERVAL) && (!streaming)) {
         lastSDPhoto = now;
         savePhotoToSD();
     }
 
-    if(now-lastSensorUpdate>SENSOR_INTERVAL) {
-        lastSensorUpdate=now;
-        if(readAHT10(ahtTemp,ahtHum)) {
-            char msg[64];
-            sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum);  
-            xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
-            ws.sendTXT(msg);
-            xSemaphoreGiveRecursive(wsMutex);
-        } 
+    // ==================== DISPLAY UPDATE ====================
+    if (now - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL) {
+        lastDisplayUpdate = now;
+        updateDisplay();
     }
 
+    // ==================== SENSOR DATA SEND ====================
+    if (now - lastSensorUpdate > SENSOR_INTERVAL) {
+        lastSensorUpdate = now;
+        float temp, hum, pres;
+        readSensors(temp, hum, pres);
+        
+        currentTemp = temp;
+        currentHum = hum;
+        currentPressure = pres;
+        
+        char msg[64];
+        sprintf(msg,"temp:%.1f hum:%.1f pres:%.1f",currentTemp,currentHum,currentPressure);  
+        xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
+        ws.sendTXT(msg);
+        xSemaphoreGiveRecursive(wsMutex);
+    }
+
+    // ==================== VIDEO STREAMING ====================
     if (streaming && (now - lastFrame > FRAME_INTERVAL)) {
         lastFrame = now;
         sendPhoto();
