@@ -16,6 +16,11 @@
 #include <GyverBME280.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+
+// Firebase configuration
+#define API_KEY "AIzaSyCc-wNDLIRJTpTFV8Bqi3Ct0b1a2MxAqaY"
+#define DATABASE_URL "https://esp-rats-default-rtdb.europe-west1.firebasedatabase.app/"
 
 #define PCF8574_ADDRESS 0x20
 #define OLED_ADDR 0x3C
@@ -64,6 +69,7 @@
 #define SENSOR_INTERVAL 60000
 #define DISPLAY_UPDATE_INTERVAL 1000
 #define TELEGRAM_POLL_INTERVAL 2000
+#define FIREBASE_UPDATE_INTERVAL 60000 // 5 минут
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -106,12 +112,19 @@ unsigned long lastSensorUpdate = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastTelegramAlert = 0;
 unsigned long lastTelegramCheck = 0;
+unsigned long lastFirebaseUpdate = 0;
 
 volatile bool fl = 0;
 
 float currentTemp = 0;
 float currentHum = 0;
 float currentPressure = 0;
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig firebaseConfig;
+bool firebaseReady = false;
 
 WebSocketsClient ws;
 
@@ -134,6 +147,7 @@ float pressureMax = 765.0;
 
 long lastMessageId = 0;
 
+// Function declarations
 bool initCamera();
 void setRGB(uint16_t r, uint16_t g, uint16_t b);
 bool initI2S();
@@ -153,6 +167,9 @@ void sendTelegramMessage(String chatId, String message);
 void checkAndSendAlert(float temp, float hum, float pres);
 String getAlertMessage(float temp, float hum, float pres);
 void checkTelegramMessages();
+void handleTelegramCommand(String chatId, String text);
+void initFirebase();
+void sendSensorDataToFirebase(float temperature, float humidity, float pressure);
 
 void IRAM_ATTR onButtonTimer() {
     checkButtonFlag = true;
@@ -199,6 +216,171 @@ String urlencode(String str) {
     }
     return encodedString;
 }
+
+void initFirebase() {
+    // Настройка конфигурации Firebase
+    firebaseConfig.api_key = API_KEY;
+    firebaseConfig.database_url = DATABASE_URL;
+    
+    // Используем Database Secret для аутентификации
+    firebaseConfig.signer.tokens.legacy_token = "QT3p4PSApQnlcf7vNgs3Q6nSMMCcJbszQ5INp0QW";
+    
+    Firebase.begin(&firebaseConfig, &auth);
+    Firebase.reconnectWiFi(true);
+    
+    // Ожидание подключения
+    Serial.print("Connecting to Firebase");
+    int timeout = 0;
+    while (!Firebase.ready() && timeout < 20) {
+        delay(500);
+        Serial.print(".");
+        timeout++;
+    }
+    Serial.println();
+    
+    firebaseReady = Firebase.ready();
+    
+    if (firebaseReady) {
+        Serial.println("Firebase connected successfully!");
+        
+        // Отправляем тестовые данные
+        FirebaseJson testJson;
+        testJson.set("status", "online");
+        testJson.set("timestamp", String(millis()));
+        testJson.set("ip", WiFi.localIP().toString());
+        if (Firebase.RTDB.setJSON(&fbdo, "/system_status", &testJson)) {
+            Serial.println("Test data sent to Firebase");
+        }
+    } else {
+        Serial.printf("Firebase connection failed: %s\n", fbdo.errorReason().c_str());
+    }
+}
+
+void sendSensorDataToFirebase(float temperature, float humidity, float pressure) {
+    if (!firebaseReady) {
+        Serial.println("Firebase not ready, skipping");
+        return;
+    }
+    
+    // Получаем текущее время
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+    
+    char dateOnly[11];
+    strftime(dateOnly, sizeof(dateOnly), "%Y-%m-%d", &timeinfo);
+    
+    // 1. Отправляем текущие данные
+    FirebaseJson json;
+    json.set("timestamp", timestamp);
+    json.set("temperature", temperature);
+    json.set("humidity", humidity);
+    json.set("pressure", pressure);
+    
+    String currentPath = "/sensors/current";
+    if (Firebase.RTDB.setJSON(&fbdo, currentPath.c_str(), &json)) {
+        Serial.println("Current sensor data sent to Firebase");
+    } else {
+        Serial.printf("Firebase error: %s\n", fbdo.errorReason().c_str());
+    }
+    
+    // 2. Сохраняем в историю
+    char timeStampShort[9];
+    strftime(timeStampShort, sizeof(timeStampShort), "%H:%M:%S", &timeinfo);
+    
+    char historyPath[128];
+    sprintf(historyPath, "/sensors/history/%s/%s", dateOnly, timeStampShort);
+    
+    if (Firebase.RTDB.setJSON(&fbdo, historyPath, &json)) {
+        Serial.println("History data saved to Firebase");
+    }
+    
+    // 3. Push-запись для графиков
+    if (Firebase.RTDB.pushJSON(&fbdo, "/sensors/readings", &json)) {
+        Serial.println("Push data to readings list");
+    }
+}
+
+// Переменные для ночника
+bool nightLightOn = false;
+bool rainbowMode = false;
+bool softLightMode = false;
+uint8_t nightLightBrightness = 100; // 0-255
+int rainbowHue = 0;
+unsigned long lastRainbowUpdate = 0;
+#define RAINBOW_INTERVAL 50 // скорость смены цветов в мс
+
+// Функция для конвертации HSV в RGB
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
+    float c = v * s;
+    float x = c * (1 - fabs(fmod(h / 60.0, 2) - 1));
+    float m = v - c;
+    
+    float r1, g1, b1;
+    
+    if (h < 60) {
+        r1 = c; g1 = x; b1 = 0;
+    } else if (h < 120) {
+        r1 = x; g1 = c; b1 = 0;
+    } else if (h < 180) {
+        r1 = 0; g1 = c; b1 = x;
+    } else if (h < 240) {
+        r1 = 0; g1 = x; b1 = c;
+    } else if (h < 300) {
+        r1 = x; g1 = 0; b1 = c;
+    } else {
+        r1 = c; g1 = 0; b1 = x;
+    }
+    
+    r = (int)((r1 + m) * 4095);
+    g = (int)((g1 + m) * 4095);
+    b = (int)((b1 + m) * 4095);
+}
+
+// Функция обновления ночника
+void updateNightLight() {
+    if (!nightLightOn) {
+        setRGB(0, 0, 0);
+        return;
+    }
+    
+    unsigned long now = millis();
+    
+    if (rainbowMode) {
+        // Радужный режим - плавная смена цветов
+        if (now - lastRainbowUpdate > RAINBOW_INTERVAL) {
+            lastRainbowUpdate = now;
+            rainbowHue = (rainbowHue + 1) % 360;
+            
+            int r, g, b;
+            hsvToRgb(rainbowHue, 1.0, float(nightLightBrightness) / 255.0, r, g, b);
+            setRGB(r, g, b);
+        }
+    } else if (softLightMode) {
+        // Мягкий теплый свет (оранжево-желтый)
+        int r = (int)(4095 * float(nightLightBrightness) / 255.0);
+        int g = (int)(2000 * float(nightLightBrightness) / 255.0);
+        int b = (int)(500 * float(nightLightBrightness) / 255.0);
+        setRGB(r, g, b);
+    } else {
+        // Обычный белый свет
+        int brightness = (int)(4095 * float(nightLightBrightness) / 255.0);
+        setRGB(brightness, brightness, brightness);
+    }
+}
+
+// Функция для установки яркости ночника
+void setNightLightBrightness(uint8_t brightness) {
+    nightLightBrightness = constrain(brightness, 10, 255);
+    if (!nightLightOn) {
+        nightLightOn = true;
+    }
+    updateNightLight();
+}
+
 
 void sendTelegramMessage(String chatId, String message) {
     HTTPClient http;
@@ -288,6 +470,79 @@ void sendPhotoToTelegram(String chatId) {
     xSemaphoreGive(cameraMutex);
 }
 
+void handleTelegramCommand(String chatId, String text) {
+    text.toLowerCase();
+    text.trim();
+    
+    if (text == "/start" || text == "/help") {
+        String helpMsg = "ESP32 Camera System\n\n";
+        helpMsg += "Available commands:\n";
+        helpMsg += "/photo - Take photo\n";
+        helpMsg += "/sensors - Sensor data\n";
+        helpMsg += "/status - System status\n";
+        helpMsg += "/ip - Network info\n";
+        helpMsg += "/firebase - Firebase status\n";
+        helpMsg += "/help - This message\n";
+        
+        sendTelegramMessage(chatId, helpMsg);
+    }
+    else if (text == "/photo") {
+        sendTelegramMessage(chatId, "Taking photo...");
+        sendPhotoToTelegram(chatId);
+    }
+    else if (text == "/sensors") {
+        String msg = "Sensor data:\n";
+        readSensors(currentTemp, currentHum, currentPressure);
+        msg += "Temperature: " + String(currentTemp, 1) + " C\n";
+        msg += "Humidity: " + String(currentHum, 1) + " %\n";
+        msg += "Pressure: " + String(currentPressure, 1) + " mmHg\n";
+        
+        if (currentTemp < tempMin || currentTemp > tempMax) {
+            msg += "Warning: Temperature out of range\n";
+        }
+        if (currentHum < humMin || currentHum > humMax) {
+            msg += "Warning: Humidity out of range\n";
+        }
+        if (currentPressure < pressureMin || currentPressure > pressureMax) {
+            msg += "Warning: Pressure out of range\n";
+        }
+        
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/status") {
+        String msg = "System Status:\n";
+        msg += "Streaming: " + String(streaming ? "ON" : "OFF") + "\n";
+        msg += "Audio: " + String(audioStreaming ? "ON" : "OFF") + "\n";
+        msg += "Firebase: " + String(firebaseReady ? "Connected" : "Disconnected") + "\n";
+        msg += "Sensors: ";
+        if (ahtInitialized && bmeInitialized) {
+            msg += "OK\n";
+        } else {
+            msg += "Partial failure\n";
+            if (!ahtInitialized) msg += "- AHT10 not found\n";
+            if (!bmeInitialized) msg += "- BME280 not found\n";
+        }
+        
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/ip") {
+        String msg = "IP Address: " + WiFi.localIP().toString() + "\n";
+        msg += "MAC: " + WiFi.macAddress();
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/firebase") {
+        String msg = "Firebase Status: ";
+        msg += firebaseReady ? "Connected\n" : "Disconnected\n";
+        if (firebaseReady) {
+            msg += "UID: " + String(auth.token.uid.c_str()) + "\n";
+        }
+        sendTelegramMessage(chatId, msg);
+    }
+    else {
+        sendTelegramMessage(chatId, "Unknown command. Use /help for list of commands.");
+    }
+}
+
 String getAlertMessage(float temp, float hum, float pres) {
     String message = "System Alert\n\n";
     
@@ -367,7 +622,6 @@ void checkTelegramMessages() {
     if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
         
-        // Простой парсинг JSON без библиотеки
         int msgStart = payload.indexOf("\"message_id\":");
         while (msgStart > 0) {
             int msgIdStart = msgStart + 13;
@@ -378,14 +632,12 @@ void checkTelegramMessages() {
             if (msgId > lastMessageId) {
                 lastMessageId = msgId;
                 
-                // Ищем chat_id
                 int chatIdStart = payload.indexOf("\"chat\":{\"id\":", msgIdStart);
                 if (chatIdStart > 0) {
                     int chatIdValStart = chatIdStart + 13;
                     int chatIdValEnd = payload.indexOf(",", chatIdValStart);
                     String chatIdStr = payload.substring(chatIdValStart, chatIdValEnd);
                     
-                    // Ищем текст сообщения
                     int textStart = payload.indexOf("\"text\":\"", msgIdStart);
                     if (textStart > 0) {
                         int textValStart = textStart + 8;
@@ -402,69 +654,6 @@ void checkTelegramMessages() {
     }
     
     http.end();
-}
-
-void handleTelegramCommand(String chatId, String text) {
-    text.toLowerCase();
-    text.trim();
-    
-    if (text == "/start" || text == "/help") {
-        String helpMsg = "ESP32 Camera System\n\n";
-        helpMsg += "Available commands:\n";
-        helpMsg += "/photo - Take photo\n";
-        helpMsg += "/sensors - Sensor data\n";
-        helpMsg += "/status - System status\n";
-        helpMsg += "/ip - Network info\n";
-        helpMsg += "/help - This message\n";
-        
-        sendTelegramMessage(chatId, helpMsg);
-    }
-    else if (text == "/photo") {
-        sendTelegramMessage(chatId, "Taking photo...");
-        sendPhotoToTelegram(chatId);
-    }
-    else if (text == "/sensors") {
-        String msg = "Sensor data:\n";
-        readSensors(currentTemp, currentHum, currentPressure);
-        msg += "Temperature: " + String(currentTemp, 1) + " C\n";
-        msg += "Humidity: " + String(currentHum, 1) + " %\n";
-        msg += "Pressure: " + String(currentPressure, 1) + " mmHg\n";
-        
-        if (currentTemp < tempMin || currentTemp > tempMax) {
-            msg += "Warning: Temperature out of range\n";
-        }
-        if (currentHum < humMin || currentHum > humMax) {
-            msg += "Warning: Humidity out of range\n";
-        }
-        if (currentPressure < pressureMin || currentPressure > pressureMax) {
-            msg += "Warning: Pressure out of range\n";
-        }
-        
-        sendTelegramMessage(chatId, msg);
-    }
-    else if (text == "/status") {
-        String msg = "System Status:\n";
-        msg += "Streaming: " + String(streaming ? "ON" : "OFF") + "\n";
-        msg += "Audio: " + String(audioStreaming ? "ON" : "OFF") + "\n";
-        msg += "Sensors: ";
-        if (ahtInitialized && bmeInitialized) {
-            msg += "OK\n";
-        } else {
-            msg += "Partial failure\n";
-            if (!ahtInitialized) msg += "- AHT10 not found\n";
-            if (!bmeInitialized) msg += "- BME280 not found\n";
-        }
-        
-        sendTelegramMessage(chatId, msg);
-    }
-    else if (text == "/ip") {
-        String msg = "IP Address: " + WiFi.localIP().toString() + "\n";
-        msg += "MAC: " + WiFi.macAddress();
-        sendTelegramMessage(chatId, msg);
-    }
-    else {
-        sendTelegramMessage(chatId, "Unknown command. Use /help for list of commands.");
-    }
 }
 
 bool initAHT10() {
@@ -851,6 +1040,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         else if(cmd == "telegram_test") {
             sendTelegramMessage(chatID, "ESP32 connected! Test message.");
         }
+        else if(cmd == "firebase_update") {
+            sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
+        }
     }
 }
 
@@ -872,7 +1064,8 @@ void setup() {
         delay(500);
     
     Serial.println("\nWiFi connected!");
-    sendTelegramMessage(chatID, "ESP32 Camera System Started! Use /help for commands.");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
 
     initCamera();
     cameraMutex = xSemaphoreCreateMutex();
@@ -951,12 +1144,20 @@ void setup() {
         Serial.println("Warning: BME280/BMP280 not found");
     }
 
+    // Инициализация Firebase
+    initFirebase();
+
     ws.begin(ws_host,ws_port,ws_path);
     ws.onEvent(webSocketEvent);
     ws.setReconnectInterval(2000);
     buttonTicker.attach_ms(20, onButtonTimer);
     
     updateDisplay();
+    
+    // Отправляем статус в Telegram
+    String startupMsg = "ESP32 Camera System Started!\n";
+    startupMsg += "Firebase: " + String(firebaseReady ? "Connected" : "Disconnected");
+    sendTelegramMessage(chatID, startupMsg);
     
     Serial.println("Setup completed!");
 }
@@ -966,7 +1167,6 @@ void loop() {
     ws.loop();
     xSemaphoreGiveRecursive(wsMutex);
     
-    // Проверка сообщений Telegram каждые 2 секунды
     if (millis() - lastTelegramCheck > TELEGRAM_POLL_INTERVAL) {
         checkTelegramMessages();
         lastTelegramCheck = millis();
@@ -1048,6 +1248,12 @@ void loop() {
         xSemaphoreGiveRecursive(wsMutex);
         
         checkAndSendAlert(temp, hum, pres);
+    }
+    
+    // Отправка данных в Firebase каждые 5 минут
+    if (now - lastFirebaseUpdate > FIREBASE_UPDATE_INTERVAL) {
+        lastFirebaseUpdate = now;
+        sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
     }
 
     if (streaming && (now - lastFrame > FRAME_INTERVAL)) {
