@@ -14,6 +14,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <GyverBME280.h>
+#include <HTTPClient.h>
 
 #define PCF8574_ADDRESS 0x20
 #define OLED_ADDR 0x3C
@@ -101,6 +102,7 @@ unsigned long lastFrame = 0;
 unsigned long lastTrigger = 0;
 unsigned long lastSensorUpdate = 0;
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastTelegramAlert = 0;
 
 volatile bool fl = 0;
 
@@ -117,12 +119,23 @@ const char* ws_host = "10.122.132.96";
 const uint16_t ws_port = 8080;
 const char* ws_path = "/ws";
 
+const char* botToken = "7644572719:AAHr0MIQVg7U5_2dibiUGIIfrVqIulMdI9c";
+const char* chatID = "949226271";
+
+float tempMin = 18.0;
+float tempMax = 26.0;
+float humMin = 40.0;
+float humMax = 60.0;
+float pressureMin = 745.0;
+float pressureMax = 765.0;
+
 bool initCamera();
 void setRGB(uint16_t r, uint16_t g, uint16_t b);
 bool initI2S();
 void savePhotoToSD();
 bool detectSound();
 void sendPhoto();
+void sendPhotoToTelegram();
 void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len);
 void sendAudio();
 void updateDisplay();
@@ -131,6 +144,9 @@ bool initAHT10();
 bool readAHT10(float &temperature, float &humidity);
 void readSensors(float &temperature, float &humidity, float &pressure);
 const char* getDayOfWeek(int wday);
+void sendTelegramMessage(String message);
+void checkAndSendAlert(float temp, float hum, float pres);
+String getAlertMessage(float temp, float hum, float pres);
 
 void IRAM_ATTR onButtonTimer() {
     checkButtonFlag = true;
@@ -146,6 +162,181 @@ const char* getDayOfWeek(int wday) {
         case 5: return "Fri";
         case 6: return "Sat";
         default: return "???";
+    }
+}
+
+void sendTelegramMessage(String message) {
+    HTTPClient http;
+    
+    String encodedMessage = message;
+    encodedMessage.replace(" ", "%20");
+    encodedMessage.replace("\n", "%0A");
+    encodedMessage.replace("!", "%21");
+    encodedMessage.replace("?", "%3F");
+    encodedMessage.replace("#", "%23");
+    encodedMessage.replace("$", "%24");
+    encodedMessage.replace("&", "%26");
+    encodedMessage.replace("'", "%27");
+    encodedMessage.replace("(", "%28");
+    encodedMessage.replace(")", "%29");
+    encodedMessage.replace("*", "%2A");
+    encodedMessage.replace("+", "%2B");
+    encodedMessage.replace(",", "%2C");
+    encodedMessage.replace("/", "%2F");
+    encodedMessage.replace(":", "%3A");
+    encodedMessage.replace(";", "%3B");
+    encodedMessage.replace("=", "%3D");
+    encodedMessage.replace("@", "%40");
+    
+    String url = "https://api.telegram.org/bot" + String(botToken) + 
+                 "/sendMessage?chat_id=" + chatID + "&text=" + encodedMessage;
+    
+    http.begin(url);
+    http.setTimeout(5000);
+    
+    int httpCode = http.GET();
+    
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+            Serial.println("Telegram message sent");
+        } else {
+            Serial.printf("HTTP error: %d\n", httpCode);
+        }
+    } else {
+        Serial.printf("Connection error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+}
+
+void sendPhotoToTelegram() {
+    if (xSemaphoreTake(cameraMutex, portMAX_DELAY) != pdTRUE) return;
+    
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        xSemaphoreGive(cameraMutex);
+        return;
+    }
+    
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + String(botToken) + "/sendPhoto";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW");
+    
+    String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    
+    String beginBoundary = "--" + boundary + "\r\n";
+    beginBoundary += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+    beginBoundary += String(chatID) + "\r\n";
+    
+    beginBoundary += "--" + boundary + "\r\n";
+    beginBoundary += "Content-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\n";
+    beginBoundary += "Content-Type: image/jpeg\r\n\r\n";
+    
+    String endBoundary = "\r\n--" + boundary + "--\r\n";
+    
+    int bodyLength = beginBoundary.length() + fb->len + endBoundary.length();
+    
+    uint8_t* postData = (uint8_t*)malloc(bodyLength);
+    if (!postData) {
+        Serial.println("Failed to allocate memory");
+        esp_camera_fb_return(fb);
+        xSemaphoreGive(cameraMutex);
+        return;
+    }
+    
+    size_t idx = 0;
+    memcpy(postData + idx, beginBoundary.c_str(), beginBoundary.length());
+    idx += beginBoundary.length();
+    
+    memcpy(postData + idx, fb->buf, fb->len);
+    idx += fb->len;
+    
+    memcpy(postData + idx, endBoundary.c_str(), endBoundary.length());
+    idx += endBoundary.length();
+    
+    int httpCode = http.POST(postData, idx);
+    
+    if (httpCode == HTTP_CODE_OK) {
+        Serial.println("Photo sent to Telegram successfully!");
+    } else {
+        Serial.printf("Failed to send photo, HTTP code: %d\n", httpCode);
+        if (httpCode > 0) {
+            String response = http.getString();
+            Serial.println("Response: " + response);
+        }
+    }
+    
+    free(postData);
+    esp_camera_fb_return(fb);
+    http.end();
+    xSemaphoreGive(cameraMutex);
+}
+
+String getAlertMessage(float temp, float hum, float pres) {
+    String message = "⚠️ SYSTEM ALERT ⚠️\n\n";
+    
+    bool alert = false;
+    
+    if (temp < tempMin) {
+        message += "❄️ TEMPERATURE TOO LOW!\n";
+        message += "   Current: " + String(temp, 1) + "°C\n";
+        message += "   Normal: " + String(tempMin, 1) + "-" + String(tempMax, 1) + "°C\n\n";
+        alert = true;
+    } else if (temp > tempMax) {
+        message += "🔥 TEMPERATURE TOO HIGH!\n";
+        message += "   Current: " + String(temp, 1) + "°C\n";
+        message += "   Normal: " + String(tempMin, 1) + "-" + String(tempMax, 1) + "°C\n\n";
+        alert = true;
+    }
+    
+    if (hum < humMin) {
+        message += "🏜️ HUMIDITY TOO LOW!\n";
+        message += "   Current: " + String(hum, 1) + "%\n";
+        message += "   Normal: " + String(humMin, 1) + "-" + String(humMax, 1) + "%\n\n";
+        alert = true;
+    } else if (hum > humMax) {
+        message += "💧 HUMIDITY TOO HIGH!\n";
+        message += "   Current: " + String(hum, 1) + "%\n";
+        message += "   Normal: " + String(humMin, 1) + "-" + String(humMax, 1) + "%\n\n";
+        alert = true;
+    }
+    
+    if (pres < pressureMin) {
+        message += "📉 PRESSURE TOO LOW!\n";
+        message += "   Current: " + String(pres, 1) + " mmHg\n";
+        message += "   Normal: " + String(pressureMin, 1) + "-" + String(pressureMax, 1) + " mmHg\n\n";
+        alert = true;
+    } else if (pres > pressureMax) {
+        message += "📈 PRESSURE TOO HIGH!\n";
+        message += "   Current: " + String(pres, 1) + " mmHg\n";
+        message += "   Normal: " + String(pressureMin, 1) + "-" + String(pressureMax, 1) + " mmHg\n\n";
+        alert = true;
+    }
+    
+    if (alert) {
+        message += "🕐 Uptime: " + String(millis() / 60000) + " min\n";
+    } else {
+        message = "";
+    }
+    
+    return message;
+}
+
+void checkAndSendAlert(float temp, float hum, float pres) {
+    unsigned long now = millis();
+    
+    if (now - lastTelegramAlert < 60000) return;
+    
+    String alertMsg = getAlertMessage(temp, hum, pres);
+    if (alertMsg.length() > 0) {
+        sendTelegramMessage(alertMsg);
+        lastTelegramAlert = now;
+        
+        delay(1000);
+        sendPhotoToTelegram();
     }
 }
 
@@ -221,7 +412,7 @@ void readSensors(float &temperature, float &humidity, float &pressure) {
     
     if (bmeInitialized) {
         float pressurePa = bme.readPressure();
-        pressure = pressureToMmHg(pressurePa);
+        pressure = pressurePa / 133.322f;
     }
 }
 
@@ -527,6 +718,12 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         }
         else if(cmd == "audio_on") audioStreaming = true;
         else if(cmd == "audio_off") audioStreaming = false;
+        else if(cmd == "telegram_photo") {
+            sendPhotoToTelegram();
+        }
+        else if(cmd == "telegram_test") {
+            sendTelegramMessage("ESP32 connected! Test message.");
+        }
     }
 }
 
@@ -546,6 +743,9 @@ void setup() {
     WiFi.setSleep(false);
     while(WiFi.status()!=WL_CONNECTED)
         delay(500);
+    
+    Serial.println("\nWiFi connected!");
+    sendTelegramMessage("ESP32 Camera System Started!");
 
     initCamera();
     cameraMutex = xSemaphoreCreateMutex();
@@ -630,6 +830,8 @@ void setup() {
     buttonTicker.attach_ms(20, onButtonTimer);
     
     updateDisplay();
+    
+    Serial.println("Setup completed!");
 }
 
 void loop() {
@@ -711,6 +913,8 @@ void loop() {
         xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
         ws.sendTXT(msg);
         xSemaphoreGiveRecursive(wsMutex);
+        
+        checkAndSendAlert(temp, hum, pres);
     }
 
     if (streaming && (now - lastFrame > FRAME_INTERVAL)) {
