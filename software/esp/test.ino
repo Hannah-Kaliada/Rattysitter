@@ -13,189 +13,884 @@
 #include <Ticker.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <GyverBME280.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+
+#define API_KEY "AIzaSyCc-wNDLIRJTpTFV8Bqi3Ct0b1a2MxAqaY"
+#define DATABASE_URL "https://esp-rats-default-rtdb.europe-west1.firebasedatabase.app/"
 
 #define PCF8574_ADDRESS 0x20
-#define TOUCH_PIN 0
-#define DEBOUNCE_DELAY 50
-#define BUTTON_UPDATE_INTERVAL 10
+#define OLED_ADDR 0x3C
+#define AHT10_ADDR 0x38
+#define BME280_ADDR 0x76
+#define PCA9685_ADDR 0x40
 
+#define TOUCH_PIN 0
 #define LED_R_CH 0
 #define LED_G_CH 1
 #define LED_B_CH 2
 
+#define PWDN_GPIO_NUM -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 15
+#define SIOD_GPIO_NUM 4
+#define SIOC_GPIO_NUM 5
+
+#define Y2_GPIO_NUM 11
+#define Y3_GPIO_NUM 9
+#define Y4_GPIO_NUM 8
+#define Y5_GPIO_NUM 10
+#define Y6_GPIO_NUM 12
+#define Y7_GPIO_NUM 18
+#define Y8_GPIO_NUM 17
+#define Y9_GPIO_NUM 16
+
+#define VSYNC_GPIO_NUM 6
+#define HREF_GPIO_NUM 7
+#define PCLK_GPIO_NUM 13
+
+#define I2S_PORT I2S_NUM_1
+#define MIC_WS   14
+#define MIC_DATA 42
+#define MIC_BCLK 41
+
+#define SAMPLE_RATE 16000
+#define SOUND_THRESHOLD 1000
+#define REFRACTORY_MS 1000
+
+#define DEBOUNCE_DELAY 50
+#define BUTTON_UPDATE_INTERVAL 10
+#define SD_PHOTO_INTERVAL 30000
+#define FRAME_INTERVAL 10
+
+#define SENSOR_INTERVAL 60000
+#define DISPLAY_UPDATE_INTERVAL 1000
+#define TELEGRAM_POLL_INTERVAL 2000
+#define FIREBASE_UPDATE_INTERVAL 60000
+#define RAINBOW_INTERVAL 50
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
 
-
-
-xSemaphoreHandle cameraMutex;           // мьютекс для доступа к камере
-xSemaphoreHandle i2sMutex;              // мьютекс для доступа к I2S
-unsigned long lastSDPhoto = 0;           // время последнего сохранения на SD
-const unsigned long SD_PHOTO_INTERVAL = 60000; // интервал 1 минута
-
+#define AUDIO_SAMPLES 2048                 
+#define AUDIO_BYTES (AUDIO_SAMPLES * 2)   
 
 Adafruit_PCF8574 pcf;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-Adafruit_PWMServoDriver pca(0x40);
+Adafruit_PWMServoDriver pca(PCA9685_ADDR);
+GyverBME280 bme;
 
+uint8_t audioBuf[AUDIO_BYTES];
+
+xSemaphoreHandle cameraMutex = nullptr;          
+xSemaphoreHandle i2sMutex = nullptr;            
+SemaphoreHandle_t wsMutex = nullptr;
 QueueHandle_t soundEventQueue = nullptr;
+QueueHandle_t audioQueue = nullptr;
 TaskHandle_t soundTaskHandle = nullptr;
 
+typedef struct {
+    uint8_t* data;
+    size_t len;
+} audio_packet_t;
 
 Ticker buttonTicker;
 volatile bool checkButtonFlag = false;
 
-
 bool streaming = false;
+bool audioStreaming = false;
+bool bmeInitialized = false;
+bool ahtInitialized = false;
+bool nightLightOn = false;
+bool rainbowMode = false;
+bool softLightMode = false;
+
+uint8_t nightLightBrightness = 100;
+int rainbowHue = 0;
+
+unsigned long lastI2SInit = 0;
+unsigned long lastSDPhoto = 0;        
 unsigned long lastFrame = 0;
-const int FRAME_INTERVAL = 10; 
+unsigned long lastTrigger = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastTelegramAlert = 0;
+unsigned long lastTelegramCheck = 0;
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastRainbowUpdate = 0;
+
+volatile bool fl = 0;
+
+float currentTemp = 0;
+float currentHum = 0;
+float currentPressure = 0;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig firebaseConfig;
+bool firebaseReady = false;
+
+WebSocketsClient ws;
+
+const char* ssid = "Clown";
+const char* password = "12345678";
+
+const char* ws_host = "10.122.132.96";
+const uint16_t ws_port = 8080;
+const char* ws_path = "/ws";
+
+const char* botToken = "7644572719:AAHr0MIQVg7U5_2dibiUGIIfrVqIulMdI9c";
+const char* chatID = "949226271";
+
+float tempMin = 18.0;
+float tempMax = 26.0;
+float humMin = 40.0;
+float humMax = 60.0;
+float pressureMin = 745.0;
+float pressureMax = 765.0;
+
+long lastUpdateId = 0;
+
+bool initCamera();
+void setRGB(uint16_t r, uint16_t g, uint16_t b);
+bool initI2S();
+void savePhotoToSD();
+bool detectSound();
+void sendPhoto();
+void sendPhotoToTelegram(String chatId);
+void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len);
+void sendAudio();
+void updateDisplay();
+bool initBME280();
+bool initAHT10();
+bool readAHT10(float &temperature, float &humidity);
+void readSensors(float &temperature, float &humidity, float &pressure);
+const char* getDayOfWeek(int wday);
+void sendTelegramMessage(String chatId, String message);
+void checkAndSendAlert(float temp, float hum, float pres);
+String getAlertMessage(float temp, float hum, float pres);
+void checkTelegramMessages();
+void handleTelegramCommand(String chatId, String text);
+void initFirebase();
+void sendSensorDataToFirebase(float temperature, float humidity, float pressure);
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b);
+void updateNightLight();
+void setNightLightBrightness(uint8_t brightness);
+void handleNightLightCommand(String cmd);
 
 void IRAM_ATTR onButtonTimer() {
     checkButtonFlag = true;
 }
 
-WebSocketsClient ws;
-
-
-const char* ssid = "Clown";
-const char* password = "12345678";
-
-
-const char* ws_host = "10.241.52.96";
-const uint16_t ws_port = 8080;
-const char* ws_path = "/ws";
-
-
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
-
-
-#define I2S_PORT I2S_NUM_1
-#define SAMPLE_RATE 16000
-#define MIC_WS   15
-#define MIC_DATA 13
-#define MIC_BCLK 2
-
-
-#define SOUND_THRESHOLD 1000
-#define REFRACTORY_MS 1000
-
-
-unsigned long lastTrigger = 0;
-unsigned long lastSensorUpdate = 0;
-
-
-#define SENSOR_INTERVAL 60000
-
-
-float ahtTemp = 0;
-float ahtHum = 0;
-
-void soundTask(void *pvParameters) {
-    while (1) {
-        if (detectSound()) {
-            int evt = 1;
-            xQueueSend(soundEventQueue, &evt, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
+const char* getDayOfWeek(int wday) {
+    switch(wday) {
+        case 0: return "Вс";
+        case 1: return "Пн";
+        case 2: return "Вт";
+        case 3: return "Ср";
+        case 4: return "Чт";
+        case 5: return "Пт";
+        case 6: return "Сб";
+        default: return "???";
     }
 }
 
-bool readAHT10(float &temperature, float &humidity) {
-
-
-  Wire.beginTransmission(0x38);
-  Wire.write(0xAC);
-  Wire.write(0x33);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) return false;
-
-
-  delay(80);
-
-
-  Wire.requestFrom(0x38, 6);
-  if (Wire.available() != 6) return false;
-
-
-  uint8_t data[6];
-  for (int i = 0; i < 6; i++) data[i] = Wire.read();
-
-
-  uint32_t rawHum = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
-  uint32_t rawTemp = ((uint32_t)(data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
-
-
-  humidity = (rawHum * 100.0) / 1048576.0;
-  temperature = ((rawTemp * 200.0) / 1048576.0) - 50;
-
-
-  return true;
+String urlencode(String str) {
+    String encodedString = "";
+    char c;
+    char code0;
+    char code1;
+    for (int i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (c == ' ') {
+            encodedString += "%20";
+        } else if (isalnum(c)) {
+            encodedString += c;
+        } else {
+            code1 = (c & 0xf) + '0';
+            if ((c & 0xf) > 9) {
+                code1 = (c & 0xf) - 10 + 'A';
+            }
+            c = (c >> 4) & 0xf;
+            code0 = c + '0';
+            if (c > 9) {
+                code0 = c - 10 + 'A';
+            }
+            encodedString += '%';
+            encodedString += code0;
+            encodedString += code1;
+        }
+    }
+    return encodedString;
 }
 
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
+    float c = v * s;
+    float x = c * (1 - fabs(fmod(h / 60.0, 2) - 1));
+    float m = v - c;
+    
+    float r1, g1, b1;
+    
+    if (h < 60) {
+        r1 = c; g1 = x; b1 = 0;
+    } else if (h < 120) {
+        r1 = x; g1 = c; b1 = 0;
+    } else if (h < 180) {
+        r1 = 0; g1 = c; b1 = x;
+    } else if (h < 240) {
+        r1 = 0; g1 = x; b1 = c;
+    } else if (h < 300) {
+        r1 = x; g1 = 0; b1 = c;
+    } else {
+        r1 = c; g1 = 0; b1 = x;
+    }
+    
+    r = (int)((r1 + m) * 4095);
+    g = (int)((g1 + m) * 4095);
+    b = (int)((b1 + m) * 4095);
+}
+
+void updateNightLight() {
+    if (!nightLightOn) {
+        setRGB(0, 0, 0);
+        return;
+    }
+    
+    unsigned long now = millis();
+    
+    if (rainbowMode) {
+        if (now - lastRainbowUpdate > RAINBOW_INTERVAL) {
+            lastRainbowUpdate = now;
+            rainbowHue = (rainbowHue + 1) % 360;
+            
+            int r, g, b;
+            hsvToRgb(rainbowHue, 1.0, float(nightLightBrightness) / 255.0, r, g, b);
+            setRGB(r, g, b);
+        }
+    } else if (softLightMode) {
+        int r = (int)(4095 * float(nightLightBrightness) / 255.0);
+        int g = (int)(2000 * float(nightLightBrightness) / 255.0);
+        int b = (int)(500 * float(nightLightBrightness) / 255.0);
+        setRGB(r, g, b);
+    } else {
+        int brightness = (int)(4095 * float(nightLightBrightness) / 255.0);
+        setRGB(brightness, brightness, brightness);
+    }
+}
+
+void setNightLightBrightness(uint8_t brightness) {
+    nightLightBrightness = constrain(brightness, 10, 255);
+    if (!nightLightOn) {
+        nightLightOn = true;
+    }
+    updateNightLight();
+}
+
+void handleNightLightCommand(String cmd) {
+    if (cmd == "light_on" || cmd == "/light_on") {
+        nightLightOn = true;
+        softLightMode = true;
+        rainbowMode = false;
+        nightLightBrightness = 100;
+        updateNightLight();
+    }
+    else if (cmd == "light_off" || cmd == "/light_off") {
+        nightLightOn = false;
+        rainbowMode = false;
+        softLightMode = false;
+        setRGB(0, 0, 0);
+    }
+    else if (cmd == "light_soft" || cmd == "/light_soft") {
+        nightLightOn = true;
+        softLightMode = true;
+        rainbowMode = false;
+        updateNightLight();
+    }
+    else if (cmd == "light_rainbow" || cmd == "/light_rainbow") {
+        nightLightOn = true;
+        rainbowMode = true;
+        softLightMode = false;
+        updateNightLight();
+    }
+    else if (cmd == "light_white" || cmd == "/light_white") {
+        nightLightOn = true;
+        rainbowMode = false;
+        softLightMode = false;
+        updateNightLight();
+    }
+    else if (cmd.startsWith("light_bright_")) {
+        int percent;
+        sscanf(cmd.c_str(), "light_bright_%d", &percent);
+        int brightness = map(percent, 0, 100, 0, 255);
+        setNightLightBrightness(brightness);
+    }
+}
+
+void initFirebase() {
+    firebaseConfig.api_key = API_KEY;
+    firebaseConfig.database_url = DATABASE_URL;
+    firebaseConfig.signer.tokens.legacy_token = "QT3p4PSApQnlcf7vNgs3Q6nSMMCcJbszQ5INp0QW";
+    
+    Firebase.begin(&firebaseConfig, &auth);
+    Firebase.reconnectWiFi(true);
+    
+    Serial.print("Connecting to Firebase");
+    int timeout = 0;
+    while (!Firebase.ready() && timeout < 20) {
+        delay(500);
+        Serial.print(".");
+        timeout++;
+    }
+    Serial.println();
+    
+    firebaseReady = Firebase.ready();
+    
+    if (firebaseReady) {
+        Serial.println("Firebase connected successfully!");
+        
+        FirebaseJson testJson;
+        testJson.set("status", "online");
+        testJson.set("timestamp", String(millis()));
+        testJson.set("ip", WiFi.localIP().toString());
+        if (Firebase.RTDB.setJSON(&fbdo, "/system_status", &testJson)) {
+            Serial.println("Test data sent to Firebase");
+        }
+    } else {
+        Serial.printf("Firebase connection failed: %s\n", fbdo.errorReason().c_str());
+    }
+}
+
+void sendSensorDataToFirebase(float temperature, float humidity, float pressure) {
+    if (!firebaseReady) {
+        Serial.println("Firebase not ready, skipping");
+        return;
+    }
+    
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+    
+    char dateOnly[11];
+    strftime(dateOnly, sizeof(dateOnly), "%Y-%m-%d", &timeinfo);
+    
+    FirebaseJson json;
+    json.set("timestamp", timestamp);
+    json.set("temperature", temperature);
+    json.set("humidity", humidity);
+    json.set("pressure", pressure);
+    
+    String currentPath = "/sensors/current";
+    if (Firebase.RTDB.setJSON(&fbdo, currentPath.c_str(), &json)) {
+        Serial.println("Current sensor data sent to Firebase");
+    } else {
+        Serial.printf("Firebase error: %s\n", fbdo.errorReason().c_str());
+    }
+    
+    char timeStampShort[9];
+    strftime(timeStampShort, sizeof(timeStampShort), "%H:%M:%S", &timeinfo);
+    
+    char historyPath[128];
+    sprintf(historyPath, "/sensors/history/%s/%s", dateOnly, timeStampShort);
+    
+    if (Firebase.RTDB.setJSON(&fbdo, historyPath, &json)) {
+        Serial.println("History data saved to Firebase");
+    }
+    
+    if (Firebase.RTDB.pushJSON(&fbdo, "/sensors/readings", &json)) {
+        Serial.println("Push data to readings list");
+    }
+}
+
+void sendTelegramMessage(String chatId, String message) {
+    HTTPClient http;
+    
+    String encodedMessage = urlencode(message);
+    String url = "https://api.telegram.org/bot" + String(botToken) + 
+                 "/sendMessage?chat_id=" + chatId + "&text=" + encodedMessage;
+    
+    http.begin(url);
+    http.setTimeout(5000);
+    
+    int httpCode = http.GET();
+    
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+            Serial.println("Telegram message sent");
+        } else {
+            Serial.printf("HTTP error: %d\n", httpCode);
+        }
+    } else {
+        Serial.printf("Connection error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+}
+
+void sendPhotoToTelegram(String chatId) {
+    if (xSemaphoreTake(cameraMutex, portMAX_DELAY) != pdTRUE) return;
+    
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        xSemaphoreGive(cameraMutex);
+        sendTelegramMessage(chatId, "Не удалось сделать фото");
+        return;
+    }
+    
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + String(botToken) + "/sendPhoto";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW");
+    
+    String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    
+    String beginBoundary = "--" + boundary + "\r\n";
+    beginBoundary += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+    beginBoundary += chatId + "\r\n";
+    
+    beginBoundary += "--" + boundary + "\r\n";
+    beginBoundary += "Content-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\n";
+    beginBoundary += "Content-Type: image/jpeg\r\n\r\n";
+    
+    String endBoundary = "\r\n--" + boundary + "--\r\n";
+    
+    int bodyLength = beginBoundary.length() + fb->len + endBoundary.length();
+    
+    uint8_t* postData = (uint8_t*)malloc(bodyLength);
+    if (!postData) {
+        Serial.println("Failed to allocate memory");
+        esp_camera_fb_return(fb);
+        xSemaphoreGive(cameraMutex);
+        return;
+    }
+    
+    size_t idx = 0;
+    memcpy(postData + idx, beginBoundary.c_str(), beginBoundary.length());
+    idx += beginBoundary.length();
+    
+    memcpy(postData + idx, fb->buf, fb->len);
+    idx += fb->len;
+    
+    memcpy(postData + idx, endBoundary.c_str(), endBoundary.length());
+    idx += endBoundary.length();
+    
+    int httpCode = http.POST(postData, idx);
+    
+    if (httpCode == HTTP_CODE_OK) {
+        Serial.println("Photo sent to Telegram successfully!");
+    } else {
+        Serial.printf("Failed to send photo, HTTP code: %d\n", httpCode);
+    }
+    
+    free(postData);
+    esp_camera_fb_return(fb);
+    http.end();
+    xSemaphoreGive(cameraMutex);
+}
+
+void handleTelegramCommand(String chatId, String text) {
+    Serial.print("Received command: ");
+    Serial.println(text);
+    
+    text.toLowerCase();
+    text.trim();
+    
+    if (text == "/start" || text == "/help") {
+        String helpMsg = "Система ESP32\n\n";
+        helpMsg += "Камера:\n";
+        helpMsg += "/photo - Сделать фото\n\n";
+        helpMsg += "Датчики:\n";
+        helpMsg += "/sensors - Данные датчиков\n";
+        helpMsg += "/status - Статус системы\n";
+        helpMsg += "/ip - Сетевая информация\n\n";
+        helpMsg += "Ночник:\n";
+        helpMsg += "/light_on - Включить (теплый свет)\n";
+        helpMsg += "/light_off - Выключить\n";
+        helpMsg += "/light_soft - Теплый свет\n";
+        helpMsg += "/light_rainbow - Радужный режим\n";
+        helpMsg += "/light_white - Белый свет\n";
+        helpMsg += "/light_bright_25 - Яркость 25%\n";
+        helpMsg += "/light_bright_50 - Яркость 50%\n";
+        helpMsg += "/light_bright_75 - Яркость 75%\n";
+        helpMsg += "/light_bright_100 - Яркость 100%\n\n";
+        helpMsg += "База данных:\n";
+        helpMsg += "/firebase - Статус базы данных\n";
+        helpMsg += "/firesend - Отправить данные\n";
+        
+        sendTelegramMessage(chatId, helpMsg);
+    }
+    else if (text == "/photo") {
+        sendTelegramMessage(chatId, "Делаю фото...");
+        sendPhotoToTelegram(chatId);
+    }
+    else if (text == "/sensors") {
+        String msg = "Данные датчиков:\n";
+        readSensors(currentTemp, currentHum, currentPressure);
+        msg += "Температура: " + String(currentTemp, 1) + " C\n";
+        msg += "Влажность: " + String(currentHum, 1) + " %\n";
+        msg += "Давление: " + String(currentPressure, 1) + " мм рт.ст.\n";
+        
+        if (currentTemp < tempMin || currentTemp > tempMax) {
+            msg += "Внимание: Температура вне нормы!\n";
+        }
+        if (currentHum < humMin || currentHum > humMax) {
+            msg += "Внимание: Влажность вне нормы!\n";
+        }
+        if (currentPressure < pressureMin || currentPressure > pressureMax) {
+            msg += "Внимание: Давление вне нормы!\n";
+        }
+        
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/status") {
+        String msg = "Статус системы:\n";
+        msg += "Стриминг: " + String(streaming ? "ВКЛ" : "ВЫКЛ") + "\n";
+        msg += "Аудио: " + String(audioStreaming ? "ВКЛ" : "ВЫКЛ") + "\n";
+        msg += "Ночник: " + String(nightLightOn ? "ВКЛ" : "ВЫКЛ") + "\n";
+        if (nightLightOn) {
+            msg += "Режим: ";
+            if (rainbowMode) msg += "Радуга\n";
+            else if (softLightMode) msg += "Теплый свет\n";
+            else msg += "Белый свет\n";
+            msg += "Яркость: " + String(map(nightLightBrightness, 0, 255, 0, 100)) + "%\n";
+        }
+        msg += "База данных: " + String(firebaseReady ? "Подключена" : "Отключена") + "\n";
+        msg += "Датчики: ";
+        if (ahtInitialized && bmeInitialized) msg += "ОК\n";
+        else msg += "Частичный сбой\n";
+        msg += "Время работы: " + String(millis() / 1000) + " сек\n";
+        
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/ip") {
+        String msg = "Сетевая информация:\n";
+        msg += "IP: " + WiFi.localIP().toString() + "\n";
+        msg += "MAC: " + WiFi.macAddress() + "\n";
+        msg += "RSSI: " + String(WiFi.RSSI()) + " dBm";
+        
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/firebase") {
+        String msg = "Статус базы данных: ";
+        msg += firebaseReady ? "Подключена\n" : "Отключена\n";
+        if (firebaseReady) {
+            msg += "URL: " + String(DATABASE_URL);
+        } else {
+            msg += "Ошибка: " + String(fbdo.errorReason().c_str());
+        }
+        sendTelegramMessage(chatId, msg);
+    }
+    else if (text == "/firesend") {
+        sendTelegramMessage(chatId, "Отправляю данные в базу...");
+        sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
+        sendTelegramMessage(chatId, "Данные успешно отправлены!");
+    }
+    else if (text.startsWith("/light")) {
+        handleNightLightCommand(text);
+        String response;
+        if (text == "/light_on") response = "Ночник включен (теплый свет)";
+        else if (text == "/light_off") response = "Ночник выключен";
+        else if (text == "/light_soft") response = "Режим: теплый свет";
+        else if (text == "/light_rainbow") response = "Режим: радуга";
+        else if (text == "/light_white") response = "Режим: белый свет";
+        else if (text.startsWith("/light_bright_")) {
+            int val;
+            sscanf(text.c_str(), "/light_bright_%d", &val);
+            response = "Яркость установлена на " + String(val) + "%";
+        }
+        sendTelegramMessage(chatId, response);
+    }
+    else {
+        sendTelegramMessage(chatId, "Неизвестная команда. Используйте /help для списка команд.");
+    }
+}
+
+String getAlertMessage(float temp, float hum, float pres) {
+    String message = "Тревога!\n\n";
+    
+    bool alert = false;
+    
+    if (temp < tempMin) {
+        message += "Низкая температура!\n";
+        message += "   Текущая: " + String(temp, 1) + "C\n";
+        message += "   Норма: " + String(tempMin, 1) + "-" + String(tempMax, 1) + "C\n\n";
+        alert = true;
+    } else if (temp > tempMax) {
+        message += "Высокая температура!\n";
+        message += "   Текущая: " + String(temp, 1) + "C\n";
+        message += "   Норма: " + String(tempMin, 1) + "-" + String(tempMax, 1) + "C\n\n";
+        alert = true;
+    }
+    
+    if (hum < humMin) {
+        message += "Низкая влажность!\n";
+        message += "   Текущая: " + String(hum, 1) + "%\n";
+        message += "   Норма: " + String(humMin, 1) + "-" + String(humMax, 1) + "%\n\n";
+        alert = true;
+    } else if (hum > humMax) {
+        message += "Высокая влажность!\n";
+        message += "   Текущая: " + String(hum, 1) + "%\n";
+        message += "   Норма: " + String(humMin, 1) + "-" + String(humMax, 1) + "%\n\n";
+        alert = true;
+    }
+    
+    if (pres < pressureMin) {
+        message += "Низкое давление!\n";
+        message += "   Текущее: " + String(pres, 1) + " мм рт.ст.\n";
+        message += "   Норма: " + String(pressureMin, 1) + "-" + String(pressureMax, 1) + " мм рт.ст.\n\n";
+        alert = true;
+    } else if (pres > pressureMax) {
+        message += "Высокое давление!\n";
+        message += "   Текущее: " + String(pres, 1) + " мм рт.ст.\n";
+        message += "   Норма: " + String(pressureMin, 1) + "-" + String(pressureMax, 1) + " мм рт.ст.\n\n";
+        alert = true;
+    }
+    
+    if (!alert) {
+        message = "";
+    }
+    
+    return message;
+}
+
+void checkAndSendAlert(float temp, float hum, float pres) {
+    unsigned long now = millis();
+    
+    if (now - lastTelegramAlert < 60000) return;
+    
+    String alertMsg = getAlertMessage(temp, hum, pres);
+    if (alertMsg.length() > 0) {
+        sendTelegramMessage(chatID, alertMsg);
+        lastTelegramAlert = now;
+        
+        delay(1000);
+        sendPhotoToTelegram(chatID);
+    }
+}
+
+void checkTelegramMessages() {
+    HTTPClient http;
+    
+    String url = "https://api.telegram.org/bot" + String(botToken) + "/getUpdates";
+    if (lastUpdateId > 0) {
+        url += "?offset=" + String(lastUpdateId + 1);
+    }
+    
+    http.begin(url);
+    http.setTimeout(5000);
+    
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        
+        DynamicJsonDocument doc(16384);
+        DeserializationError error = deserializeJson(doc, payload);
+        
+        if (!error) {
+            JsonArray results = doc["result"].as<JsonArray>();
+            
+            for (JsonObject update : results) {
+                long updateId = update["update_id"];
+                
+                if (updateId > lastUpdateId) {
+                    lastUpdateId = updateId;
+                }
+                
+                if (update.containsKey("message")) {
+                    JsonObject message = update["message"];
+                    String chatId = message["chat"]["id"].as<String>();
+                    
+                    if (message.containsKey("text")) {
+                        String text = message["text"].as<String>();
+                        
+                        Serial.print("Received: ");
+                        Serial.println(text);
+                        
+                        handleTelegramCommand(chatId, text);
+                    }
+                }
+            }
+        }
+    }
+    
+    http.end();
+}
+
+bool initAHT10() {
+    Wire.beginTransmission(AHT10_ADDR);
+    Wire.write(0xE1);
+    Wire.write(0x08);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("AHT10 init failed");
+        return false;
+    }
+    
+    delay(500);
+    
+    Wire.beginTransmission(AHT10_ADDR);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("AHT10 not responding after init");
+        return false;
+    }
+    
+    Serial.println("AHT10 initialized successfully");
+    return true;
+}
+
+bool readAHT10(float &temperature, float &humidity) {
+    Wire.beginTransmission(AHT10_ADDR);
+    Wire.write(0xAC);
+    Wire.write(0x33);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) return false;
+
+    delay(80);
+
+    Wire.requestFrom(AHT10_ADDR, 6);
+    if (Wire.available() != 6) return false;
+
+    uint8_t data[6];
+    for (int i = 0; i < 6; i++) data[i] = Wire.read();
+
+    if (data[0] & 0x80) {
+        Serial.println("AHT10: Sensor busy");
+        return false;
+    }
+
+    uint32_t rawHum = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
+    uint32_t rawTemp = ((uint32_t)(data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
+
+    humidity = (rawHum * 100.0) / 1048576.0;
+    temperature = ((rawTemp * 200.0) / 1048576.0) - 50;
+    return true;
+}
+
+bool initBME280() {
+    if (!bme.begin(BME280_ADDR)) {
+        Serial.println("BME280/BMP280 not found");
+        return false;
+    }
+    
+    Serial.println("BME280/BMP280 initialized for pressure");
+    return true;
+}
+
+void readSensors(float &temperature, float &humidity, float &pressure) {
+    temperature = humidity = pressure = 0;
+    
+    if (ahtInitialized) {
+        if (!readAHT10(temperature, humidity)) {
+            Serial.println("Failed to read AHT10");
+            temperature = humidity = 0;
+        }
+    }
+    
+    if (bmeInitialized) {
+        float pressurePa = bme.readPressure();
+        pressure = pressurePa / 133.322f;
+    }
+}
+
+void updateDisplay() {
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    char timeStr[9];
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+    display.print(timeStr);
+    
+    display.setTextSize(1);
+    display.setCursor(80, 8);
+    char secStr[3];
+    strftime(secStr, sizeof(secStr), "%S", &timeinfo);
+    display.print(secStr);
+    
+    display.setTextSize(1);
+    display.setCursor(0, 18);
+    char dateStr[20];
+    strftime(dateStr, sizeof(dateStr), "%d.%m.%Y", &timeinfo);
+    display.printf("%s %s", dateStr, getDayOfWeek(timeinfo.tm_wday));
+    
+    display.drawLine(0, 27, 128, 27, SSD1306_WHITE);
+    
+    if (ahtInitialized || bmeInitialized) {
+        float temp, hum, pres;
+        readSensors(temp, hum, pres);
+        
+        display.setCursor(0, 32);
+        display.printf("T: %.1f", temp);
+        display.print("C");
+        
+        display.setCursor(64, 32);
+        display.printf("H: %.1f%%", hum);
+        
+        display.setCursor(0, 48);
+        if (bmeInitialized) {
+            display.printf("P: %.1f mmHg", pres);
+        } else {
+            display.print("P: --- mmHg");
+        }
+    } else {
+        display.setCursor(10, 40);
+        display.setTextSize(2);
+        display.println("NO SENSORS");
+    }
+    
+    display.display();
+}
 
 bool initCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
 
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
 
-  camera_config_t config;
-
-
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-
-
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-
-
-  return (esp_camera_init(&config) == ESP_OK);
+    return (esp_camera_init(&config) == ESP_OK);
 }
-
 
 void setRGB(uint16_t r, uint16_t g, uint16_t b) {
-  pca.setPWM(LED_R_CH, 0, r);
-  pca.setPWM(LED_G_CH, 0, g);
-  pca.setPWM(LED_B_CH, 0, b);
+    pca.setPWM(LED_R_CH, 0, r);
+    pca.setPWM(LED_G_CH, 0, g);
+    pca.setPWM(LED_B_CH, 0, b);
 }
 
-
 bool initI2S() {
-    // Пытаемся удалить предыдущий драйвер (если был)
     esp_err_t err = i2s_driver_uninstall(I2S_PORT);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         Serial.println("I2S uninstall failed");
@@ -209,8 +904,8 @@ bool initI2S() {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
-        .dma_buf_len = 256
+        .dma_buf_count = 8,
+        .dma_buf_len = 512
     };
 
     i2s_pin_config_t pins = {
@@ -227,25 +922,22 @@ bool initI2S() {
         return false;
 
     i2s_zero_dma_buffer(I2S_PORT);
+    delay(50);
+    lastI2SInit = millis();
     return true;
 }
 
-
 void savePhotoToSD() {
-    // 1. Захватываем мьютекс I2S – блокируем звук
     xSemaphoreTake(i2sMutex, portMAX_DELAY);
-
-    // 2. Деинициализируем I2S (освобождаем пины)
     esp_err_t err = i2s_driver_uninstall(I2S_PORT);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         Serial.println("I2S uninstall error");
     }
-    delay(10); // небольшая пауза
-
-    // 3. Инициализируем SD-карту
-    if (!SD_MMC.begin()) {
+    delay(10);
+    fl = 1;
+    SD_MMC.setPins(39, 38, 40, -1, -1, -1);
+    if (!SD_MMC.begin("/sdcard", true)) {
         Serial.println("SD Card Mount Failed");
-        // Возвращаем I2S обратно
         initI2S();
         xSemaphoreGive(i2sMutex);
         return;
@@ -258,8 +950,6 @@ void savePhotoToSD() {
         xSemaphoreGive(i2sMutex);
         return;
     }
-
-    // 4. Захватываем мьютекс камеры
     if (xSemaphoreTake(cameraMutex, portMAX_DELAY) != pdTRUE) {
         SD_MMC.end();
         initI2S();
@@ -267,30 +957,24 @@ void savePhotoToSD() {
         return;
     }
 
-    // 5. Делаем паузу для стабилизации камеры после переключения пинов
     delay(50);
 
-    // 6. Пытаемся получить кадр (с повторными попытками)
     camera_fb_t *fb = NULL;
-    for (int retry = 0; retry < 3; retry++) {
-        fb = esp_camera_fb_get();
-        if (fb) break;
-        delay(10);
-    }
+    fb = esp_camera_fb_get();
 
     if (!fb) {
-        Serial.println("Camera capture failed after retries");
+        Serial.println("Camera capture failed");
         xSemaphoreGive(cameraMutex);
         SD_MMC.end();
         initI2S();
         xSemaphoreGive(i2sMutex);
+        fl = 0;
         return;
     }
 
-    // 7. Генерируем имя файла (с временем или millis)
     char filename[32];
     time_t now = time(nullptr);
-    if (now < 8 * 3600 * 2) { // время не синхронизировано
+    if (now < 8 * 3600 * 2) { 
         sprintf(filename, "/photo_%lu.jpg", millis());
     } else {
         struct tm timeinfo;
@@ -298,7 +982,6 @@ void savePhotoToSD() {
         strftime(filename, sizeof(filename), "/photo_%Y%m%d_%H%M%S.jpg", &timeinfo);
     }
 
-    // 8. Записываем на SD
     File file = SD_MMC.open(filename, FILE_WRITE);
     if (!file) {
         Serial.println("Failed to create file");
@@ -307,28 +990,21 @@ void savePhotoToSD() {
         file.close();
         Serial.printf("Saved photo: %s\n", filename);
     }
-
-    // 9. Возвращаем буфер камеры и отпускаем мьютекс камеры
     esp_camera_fb_return(fb);
     xSemaphoreGive(cameraMutex);
 
-    // 10. Завершаем работу с SD
     SD_MMC.end();
 
-    // 11. Переинициализируем I2S
     if (!initI2S()) {
         Serial.println("I2S reinit failed");
-        // В этом случае звук не будет работать, но можно попытаться ещё раз позже
-        // Возможно, стоит перезагрузить систему? Пока оставляем как есть.
     }
-
-    // 12. Отпускаем мьютекс I2S – звук снова доступен
     xSemaphoreGive(i2sMutex);
+    fl = 0;
 }
 
 bool detectSound() {
     if (xSemaphoreTake(i2sMutex, portMAX_DELAY) != pdTRUE) {
-        return false; // не удалось захватить мьютекс (маловероятно)
+        return false; 
     }
 
     uint8_t buffer[512];
@@ -349,133 +1025,176 @@ bool detectSound() {
     return (rms > SOUND_THRESHOLD);
 }
 
+void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len){
+    uint8_t* packet = (uint8_t*)malloc(4 + len);
+    if(!packet) return;
 
-void sendPhoto() {
-    if (xSemaphoreTake(cameraMutex, portMAX_DELAY) == pdTRUE) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) {
-            ws.sendBIN(fb->buf, fb->len);
-            esp_camera_fb_return(fb);
-        } else {
-            Serial.println("sendPhoto: camera capture failed");
-        }
-        xSemaphoreGive(cameraMutex);
+    packet[0] = type & 0xFF;
+    packet[1] = type >> 8;
+    packet[2] = len & 0xFF;
+    packet[3] = len >> 8;
+
+    memcpy(packet + 4, data, len);
+    
+    xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
+    ws.sendBIN(packet, 4 + len);
+    xSemaphoreGiveRecursive(wsMutex);
+    
+    free(packet);
+}
+
+void sendPhoto(){
+    if (xSemaphoreTake(cameraMutex, portMAX_DELAY) != pdTRUE) return;
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb){
+        sendBinaryPacket(1, fb->buf, fb->len);
+        esp_camera_fb_return(fb);
     }
+    xSemaphoreGive(cameraMutex);
+}
+
+void sendAudio(){
+    if (!audioStreaming) return;
+    if (xSemaphoreTake(i2sMutex, 0) != pdTRUE) return;
+
+    size_t bytesRead = 0;
+    if (i2s_read(I2S_PORT, audioBuf, AUDIO_BYTES, &bytesRead, portMAX_DELAY) == ESP_OK){
+        uint8_t* packetData = (uint8_t*)malloc(bytesRead);
+        if (packetData) {
+            memcpy(packetData, audioBuf, bytesRead);
+            audio_packet_t packet = { packetData, bytesRead };
+            if (xQueueSend(audioQueue, &packet, 0) != pdTRUE) {
+                free(packetData);
+            }
+        }
+    }
+    xSemaphoreGive(i2sMutex);
 }
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-
-
-  if(type == WStype_TEXT) {
-
-
-    String cmd = String((char*)payload);
-
-
-if(cmd == "stream_on"){
-    streaming = true;
-}
-
-else if(cmd == "stream_off"){
-    streaming = false;
-}
-
-else if(cmd == "photo"){
-    sendPhoto();
-}
-
-
-    else if(cmd == "get_sensors") {
-
-
-      char msg[64];
-      sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum);
-      ws.sendTXT(msg);
-
-
+    if(type == WStype_TEXT) {
+        String cmd = String((char*)payload);
+        if(cmd == "stream_on"){
+            streaming = true;
+        }
+        else if(cmd == "stream_off"){
+            streaming = false;
+        }
+        else if(cmd == "photo"){
+            sendPhoto();
+        }
+        else if(cmd == "get_sensors") {
+            char msg[64];
+            sprintf(msg,"temp:%.1f hum:%.1f pres:%.1f",currentTemp,currentHum,currentPressure);
+            xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
+            ws.sendTXT(msg);
+            xSemaphoreGiveRecursive(wsMutex);
+        }
+        else if(cmd.startsWith("rgb")) {
+            int r,g,b;
+            sscanf(cmd.c_str(),"rgb %d %d %d",&r,&g,&b);
+            setRGB(r,g,b);
+        }
+        else if(cmd == "reboot") {
+            ESP.restart();
+        }
+        else if(cmd == "audio_on") audioStreaming = true;
+        else if(cmd == "audio_off") audioStreaming = false;
+        else if(cmd == "telegram_photo") {
+            sendPhotoToTelegram(chatID);
+        }
+        else if(cmd == "telegram_test") {
+            sendTelegramMessage(chatID, "ESP32 подключен! Тестовое сообщение.");
+        }
+        else if(cmd == "firebase_update") {
+            sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
+        }
+        else if(cmd.startsWith("light")) {
+            handleNightLightCommand(cmd);
+        }
     }
-
-
-    else if(cmd.startsWith("rgb")) {
-
-
-      int r,g,b;
-      sscanf(cmd.c_str(),"rgb %d %d %d",&r,&g,&b);
-      setRGB(r,g,b);
-
-
-    }
-
-
-    else if(cmd == "reboot") {
-
-
-      ESP.restart();
-
-
-    }
-  }
 }
 
+void soundTask(void *pvParameters) {
+    while (1) {
+        if (millis() - lastI2SInit > 1000) {
+            sendAudio();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
 
 void setup() {
+    Serial.begin(115200);
 
+    WiFi.begin(ssid,password);
+    WiFi.setSleep(false);
+    while(WiFi.status()!=WL_CONNECTED)
+        delay(500);
+    
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
 
-  Serial.begin(115200);
+    initCamera();
+    cameraMutex = xSemaphoreCreateMutex();
+    i2sMutex = xSemaphoreCreateMutex();
 
+    Wire.begin(21,47);
+    initI2S();
 
-  WiFi.begin(ssid,password);
+    soundEventQueue = xQueueCreate(5, sizeof(int)); 
+    audioQueue = xQueueCreate(20, sizeof(audio_packet_t));
+    if (audioQueue == NULL) {
+        Serial.println("Failed to create audio queue");
+    }
+    
+    wsMutex = xSemaphoreCreateRecursiveMutex();
+    if (wsMutex == NULL) {
+        Serial.println("Failed to create wsMutex");
+    }
 
+    xTaskCreatePinnedToCore(
+        soundTask,      
+        "SoundTask",    
+        8192,           
+        NULL,   
+        1,             
+        &soundTaskHandle,
+        0          
+    );
 
-  while(WiFi.status()!=WL_CONNECTED)
-    delay(500);
+    Wire.begin(21,47);
+    Wire.setClock(100000);
+    pca.begin();
+    pca.setPWMFreq(1000);
+    setRGB(0,0,0);
+    if (pcf.begin(PCF8574_ADDRESS, &Wire)) {
+        Serial.println("Adafruit PCF8574 OK");
+        pcf.pinMode(TOUCH_PIN, INPUT_PULLUP); 
+    } else {
+        Serial.println("Adafruit PCF8574 ERROR");
+    }
 
-  initCamera();
-  cameraMutex = xSemaphoreCreateMutex();
-  i2sMutex = xSemaphoreCreateMutex();
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("OLED init failed");
+        while (true);
+    }
 
-  Wire.begin(26,27);
-  initI2S();
-soundEventQueue = xQueueCreate(5, sizeof(int)); 
-xTaskCreatePinnedToCore(
-    soundTask,      
-    "SoundTask",    
-    4096,          
-    NULL,   
-    1,             
-    &soundTaskHandle,
-    0          
-);
-  Wire.begin(26,27);
-  Wire.setClock(100000);
-  pca.begin();
-  pca.setPWMFreq(1000);
-  setRGB(0,0,0);
-  if (pcf.begin(PCF8574_ADDRESS, &Wire)) {
-    Serial.println("Adafruit PCF8574 OK на пинах 21 и 22");
-  
-    pcf.pinMode(TOUCH_PIN, INPUT_PULLUP); 
-  } else {
-    Serial.println("Adafruit PCF8574 ERROR");
-  }
-
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("OLED init failed");
-    while (true);
-  }
-
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.println("System OK");
-  display.display();
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10,20);
+    display.println("System OK");
+    display.display();
+    delay(1000);
 
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     Serial.println("Waiting for NTP time sync...");
     time_t now = time(nullptr);
     int timeout = 0;
-    while (now < 8 * 3600 * 2 && timeout < 20) { // ждём до 10 секунд
+    while (now < 8 * 3600 * 2 && timeout < 20) { 
         delay(500);
         now = time(nullptr);
         timeout++;
@@ -485,23 +1204,51 @@ xTaskCreatePinnedToCore(
     else
         Serial.println("Time sync failed, using millis() for filenames");
 
-  ws.begin(ws_host,ws_port,ws_path);
-  ws.onEvent(webSocketEvent);
-  ws.setReconnectInterval(2000);
-  buttonTicker.attach_ms(20, onButtonTimer);
+    ahtInitialized = initAHT10();
+    if (!ahtInitialized) {
+        Serial.println("Warning: AHT10 not found");
+    }
+    
+    bmeInitialized = initBME280();
+    if (!bmeInitialized) {
+        Serial.println("Warning: BME280/BMP280 not found");
+    }
 
-  
+    initFirebase();
 
+    ws.begin(ws_host,ws_port,ws_path);
+    ws.onEvent(webSocketEvent);
+    ws.setReconnectInterval(2000);
+    buttonTicker.attach_ms(20, onButtonTimer);
+    
+    updateDisplay();
+    
+    String startupMsg = "Система ESP32 запущена!\n";
+    startupMsg += "База данных: " + String(firebaseReady ? "Подключена" : "Отключена");
+    sendTelegramMessage(chatID, startupMsg);
+    
+    Serial.println("Setup completed!");
 }
 
-
 void loop() {
+    xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
+    ws.loop();
+    xSemaphoreGiveRecursive(wsMutex);
+    
+    updateNightLight();
+    
+    if (millis() - lastTelegramCheck > TELEGRAM_POLL_INTERVAL) {
+        checkTelegramMessages();
+        lastTelegramCheck = millis();
+    }
+    
+    audio_packet_t packet;
+    while (xQueueReceive(audioQueue, &packet, 0) == pdTRUE) {
+        sendBinaryPacket(2, packet.data, packet.len);
+        free(packet.data);
+    }
 
-
-  ws.loop();
-
-
-  unsigned long now = millis();
+    unsigned long now = millis();
 
     if (checkButtonFlag) {
         checkButtonFlag = false;
@@ -535,28 +1282,49 @@ void loop() {
         lastButtonState = reading;
     }
 
-  int soundEvent;
+    int soundEvent;
     if (xQueueReceive(soundEventQueue, &soundEvent, 0) == pdTRUE) {
         if (millis() - lastTrigger > REFRACTORY_MS) {
             lastTrigger = millis();
+            xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
             ws.sendTXT("sound");
+            xSemaphoreGiveRecursive(wsMutex);
         }
     }
-    if (now - lastSDPhoto >= SD_PHOTO_INTERVAL) {
+
+    if ((now - lastSDPhoto >= SD_PHOTO_INTERVAL) && (!streaming)) {
         lastSDPhoto = now;
         savePhotoToSD();
     }
 
-  if(now-lastSensorUpdate>SENSOR_INTERVAL) {
-
-    lastSensorUpdate=now;
-
-    if(readAHT10(ahtTemp,ahtHum)) {
-      char msg[64];
-      sprintf(msg,"temp:%.1f hum:%.1f",ahtTemp,ahtHum    );
-      ws.sendTXT(msg);
+    if (now - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL) {
+        lastDisplayUpdate = now;
+        updateDisplay();
     }
-  }
+
+    if (now - lastSensorUpdate > SENSOR_INTERVAL) {
+        lastSensorUpdate = now;
+        float temp, hum, pres;
+        readSensors(temp, hum, pres);
+        
+        currentTemp = temp;
+        currentHum = hum;
+        currentPressure = pres;
+        
+        char msg[64];
+        sprintf(msg,"temp:%.1f hum:%.1f pres:%.1f",currentTemp,currentHum,currentPressure);  
+        xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
+        ws.sendTXT(msg);
+        xSemaphoreGiveRecursive(wsMutex);
+        
+        checkAndSendAlert(temp, hum, pres);
+    }
+    
+    if (now - lastFirebaseUpdate > FIREBASE_UPDATE_INTERVAL) {
+        lastFirebaseUpdate = now;
+        sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
+    }
+
     if (streaming && (now - lastFrame > FRAME_INTERVAL)) {
         lastFrame = now;
         sendPhoto();
