@@ -131,7 +131,7 @@ WebSocketsClient ws;
 const char* ssid = "Clown";
 const char* password = "12345678";
 
-const char* ws_host = "10.122.132.96";
+const char* ws_host = "10.171.9.96";
 const uint16_t ws_port = 8080;
 const char* ws_path = "/ws";
 
@@ -142,8 +142,8 @@ float tempMin = 18.0;
 float tempMax = 26.0;
 float humMin = 40.0;
 float humMax = 60.0;
-float pressureMin = 745.0;
-float pressureMax = 765.0;
+float pressureMin = 738.0;
+float pressureMax = 760.0;
 
 long lastMessageId = 0;
 
@@ -1249,8 +1249,7 @@ void loop() {
         
         checkAndSendAlert(temp, hum, pres);
     }
-    
-    // Отправка данных в Firebase каждые 5 минут
+
     if (now - lastFirebaseUpdate > FIREBASE_UPDATE_INTERVAL) {
         lastFirebaseUpdate = now;
         sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
