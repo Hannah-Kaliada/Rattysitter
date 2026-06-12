@@ -1,4 +1,3 @@
-```cpp
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebSocketsClient.h>
@@ -18,6 +17,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Firebase_ESP_Client.h>
+
 
 #define API_KEY "AIzaSyCc-wNDLIRJTpTFV8Bqi3Ct0b1a2MxAqaY"
 #define DATABASE_URL "https://esp-rats-default-rtdb.europe-west1.firebasedatabase.app/"
@@ -59,6 +59,7 @@
 
 #define SAMPLE_RATE 16000
 #define SOUND_THRESHOLD 1000
+#define LOUD_SOUND_THRESHOLD 2000  // Порог для громких звуков (можно настроить)
 #define REFRACTORY_MS 1000
 
 #define DEBOUNCE_DELAY 50
@@ -76,6 +77,11 @@
 
 #define AUDIO_SAMPLES 2048                 
 #define AUDIO_BYTES (AUDIO_SAMPLES * 2)   
+
+// Переменная для отслеживания подключения к серверу
+bool serverConnected = false;
+unsigned long lastServerHeartbeat = 0;
+#define SERVER_TIMEOUT 10000  // 10 секунд без heartbeat - считаем что сервер отключен
 
 Adafruit_PCF8574 pcf;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
@@ -95,6 +101,11 @@ typedef struct {
     uint8_t* data;
     size_t len;
 } audio_packet_t;
+
+typedef struct {
+    int rms;
+    unsigned long timestamp;
+} sound_event_t;
 
 Ticker buttonTicker;
 volatile bool checkButtonFlag = false;
@@ -120,6 +131,7 @@ float currentTemp = 0;
 float currentHum = 0;
 float currentPressure = 0;
 
+// Firebase objects
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig firebaseConfig;
@@ -130,7 +142,7 @@ WebSocketsClient ws;
 const char* ssid = "Clown";
 const char* password = "12345678";
 
-const char* ws_host = "10.171.9.96";
+const char* ws_host = "10.106.107.96";
 const uint16_t ws_port = 8080;
 const char* ws_path = "/ws";
 
@@ -146,19 +158,20 @@ float pressureMax = 760.0;
 
 long lastMessageId = 0;
 
-bool nightLightOn = false;
-bool rainbowMode = false;
-bool softLightMode = false;
-uint8_t nightLightBrightness = 100;
-int rainbowHue = 0;
-unsigned long lastRainbowUpdate = 0;
-#define RAINBOW_INTERVAL 50
+// Функция для проверки, должен ли ESP32 обрабатывать Telegram
+bool shouldHandleTelegram() {
+    // Telegram обрабатывается только если сервер НЕ подключен
+    return !serverConnected;
+}
 
+// Function declarations
 bool initCamera();
 void setRGB(uint16_t r, uint16_t g, uint16_t b);
 bool initI2S();
 void savePhotoToSD();
+int detectSoundRMS();
 bool detectSound();
+bool detectLoudSound();
 void sendPhoto();
 void sendPhotoToTelegram(String chatId);
 void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len);
@@ -170,15 +183,12 @@ bool readAHT10(float &temperature, float &humidity);
 void readSensors(float &temperature, float &humidity, float &pressure);
 const char* getDayOfWeek(int wday);
 void sendTelegramMessage(String chatId, String message);
-void checkAndSendAlert(float temp, float hum, float pres);
-String getAlertMessage(float temp, float hum, float pres);
+void checkAndSendAlert(float temp, float hum, float pres, bool loudSound);
+String getAlertMessage(float temp, float hum, float pres, bool loudSound);
 void checkTelegramMessages();
 void handleTelegramCommand(String chatId, String text);
 void initFirebase();
 void sendSensorDataToFirebase(float temperature, float humidity, float pressure);
-void hsvToRgb(float h, float s, float v, int &r, int &g, int &b);
-void updateNightLight();
-void setNightLightBrightness(uint8_t brightness);
 
 void IRAM_ATTR onButtonTimer() {
     checkButtonFlag = true;
@@ -247,6 +257,7 @@ void initFirebase() {
     
     if (firebaseReady) {
         Serial.println("Firebase connected successfully!");
+        
         FirebaseJson testJson;
         testJson.set("status", "online");
         testJson.set("timestamp", String(millis()));
@@ -302,6 +313,15 @@ void sendSensorDataToFirebase(float temperature, float humidity, float pressure)
         Serial.println("Push data to readings list");
     }
 }
+
+// Переменные для ночника
+bool nightLightOn = false;
+bool rainbowMode = false;
+bool softLightMode = false;
+uint8_t nightLightBrightness = 100;
+int rainbowHue = 0;
+unsigned long lastRainbowUpdate = 0;
+#define RAINBOW_INTERVAL 50
 
 void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
     float c = v * s;
@@ -366,8 +386,13 @@ void setNightLightBrightness(uint8_t brightness) {
 }
 
 void sendTelegramMessage(String chatId, String message) {
-    HTTPClient http;
+    // Отправляем только если нет подключенного сервера
+    if (!shouldHandleTelegram()) {
+        Serial.println("Server connected, skipping Telegram message");
+        return;
+    }
     
+    HTTPClient http;
     String encodedMessage = urlencode(message);
     String url = "https://api.telegram.org/bot" + String(botToken) + 
                  "/sendMessage?chat_id=" + chatId + "&text=" + encodedMessage;
@@ -391,6 +416,12 @@ void sendTelegramMessage(String chatId, String message) {
 }
 
 void sendPhotoToTelegram(String chatId) {
+    // Отправляем фото только если нет подключенного сервера
+    if (!shouldHandleTelegram()) {
+        Serial.println("Server connected, skipping Telegram photo");
+        return;
+    }
+    
     if (xSemaphoreTake(cameraMutex, portMAX_DELAY) != pdTRUE) return;
     
     camera_fb_t *fb = esp_camera_fb_get();
@@ -454,17 +485,24 @@ void sendPhotoToTelegram(String chatId) {
 }
 
 void handleTelegramCommand(String chatId, String text) {
+    // Обрабатываем команды только если нет подключенного сервера
+    if (!shouldHandleTelegram()) {
+        Serial.println("Server connected, skipping Telegram command handling");
+        return;
+    }
+    
     text.toLowerCase();
     text.trim();
     
     if (text == "/start" || text == "/help") {
-        String helpMsg = "ESP32 Camera System\n\n";
+        String helpMsg = "ESP32 Camera System (Standalone Mode)\n\n";
         helpMsg += "Available commands:\n";
         helpMsg += "/photo - Take photo\n";
         helpMsg += "/sensors - Sensor data\n";
         helpMsg += "/status - System status\n";
         helpMsg += "/ip - Network info\n";
         helpMsg += "/firebase - Firebase status\n";
+        helpMsg += "/server - Server connection status\n";
         helpMsg += "/help - This message\n";
         
         sendTelegramMessage(chatId, helpMsg);
@@ -494,6 +532,7 @@ void handleTelegramCommand(String chatId, String text) {
     }
     else if (text == "/status") {
         String msg = "System Status:\n";
+        msg += "Mode: " + String(serverConnected ? "Server Managed" : "Standalone") + "\n";
         msg += "Streaming: " + String(streaming ? "ON" : "OFF") + "\n";
         msg += "Audio: " + String(audioStreaming ? "ON" : "OFF") + "\n";
         msg += "Firebase: " + String(firebaseReady ? "Connected" : "Disconnected") + "\n";
@@ -521,15 +560,27 @@ void handleTelegramCommand(String chatId, String text) {
         }
         sendTelegramMessage(chatId, msg);
     }
+    else if (text == "/server") {
+        String msg = "Server Status: ";
+        msg += serverConnected ? "Connected\n" : "Disconnected (Standalone mode)\n";
+        msg += "ESP32 handles Telegram: " + String(shouldHandleTelegram() ? "Yes" : "No");
+        sendTelegramMessage(chatId, msg);
+    }
     else {
         sendTelegramMessage(chatId, "Unknown command. Use /help for list of commands.");
     }
 }
 
-String getAlertMessage(float temp, float hum, float pres) {
+String getAlertMessage(float temp, float hum, float pres, bool loudSound) {
     String message = "System Alert\n\n";
     
     bool alert = false;
+    
+    // Добавляем информацию о громком звуке
+    if (loudSound) {
+        message += "🔊 Loud sound detected!\n\n";
+        alert = true;
+    }
     
     if (temp < tempMin) {
         message += "Low temperature!\n";
@@ -574,12 +625,12 @@ String getAlertMessage(float temp, float hum, float pres) {
     return message;
 }
 
-void checkAndSendAlert(float temp, float hum, float pres) {
+void checkAndSendAlert(float temp, float hum, float pres, bool loudSound) {
     unsigned long now = millis();
     
     if (now - lastTelegramAlert < 60000) return;
     
-    String alertMsg = getAlertMessage(temp, hum, pres);
+    String alertMsg = getAlertMessage(temp, hum, pres, loudSound);
     if (alertMsg.length() > 0) {
         sendTelegramMessage(chatID, alertMsg);
         lastTelegramAlert = now;
@@ -590,6 +641,11 @@ void checkAndSendAlert(float temp, float hum, float pres) {
 }
 
 void checkTelegramMessages() {
+    // Проверяем сообщения только если нет подключенного сервера
+    if (!shouldHandleTelegram()) {
+        return;
+    }
+    
     HTTPClient http;
     
     String url = "https://api.telegram.org/bot" + String(botToken) + "/getUpdates";
@@ -767,6 +823,11 @@ void updateDisplay() {
         display.println("NO SENSORS");
     }
     
+    // Показываем статус сервера
+    display.setTextSize(1);
+    display.setCursor(0, 56);
+    display.print(serverConnected ? "SRV:ON" : "SRV:OFF");
+    
     display.display();
 }
 
@@ -918,9 +979,9 @@ void savePhotoToSD() {
     fl = 0;
 }
 
-bool detectSound() {
+int detectSoundRMS() {
     if (xSemaphoreTake(i2sMutex, portMAX_DELAY) != pdTRUE) {
-        return false; 
+        return 0; 
     }
 
     uint8_t buffer[512];
@@ -929,7 +990,7 @@ bool detectSound() {
 
     xSemaphoreGive(i2sMutex);
 
-    if (res != ESP_OK) return false;
+    if (res != ESP_OK) return 0;
 
     int16_t *samples = (int16_t*)buffer;
     int count = bytesRead / 2;
@@ -937,8 +998,15 @@ bool detectSound() {
     for (int i = 0; i < count; i++)
         sum += abs(samples[i]);
 
-    int rms = sum / count;
-    return (rms > SOUND_THRESHOLD);
+    return sum / count;
+}
+
+bool detectSound() {
+    return detectSoundRMS() > SOUND_THRESHOLD;
+}
+
+bool detectLoudSound() {
+    return detectSoundRMS() > LOUD_SOUND_THRESHOLD;
 }
 
 void sendBinaryPacket(uint16_t type, const uint8_t* data, uint16_t len){
@@ -989,8 +1057,21 @@ void sendAudio(){
 }
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-    if(type == WStype_TEXT) {
+    if(type == WStype_CONNECTED) {
+        serverConnected = true;
+        lastServerHeartbeat = millis();
+        Serial.println("Server connected! Telegram handling disabled on ESP32");
+    }
+    else if(type == WStype_DISCONNECTED) {
+        serverConnected = false;
+        Serial.println("Server disconnected! Telegram handling enabled on ESP32");
+    }
+    else if(type == WStype_TEXT) {
         String cmd = String((char*)payload);
+        
+        // Обновляем heartbeat при получении любого сообщения от сервера
+        lastServerHeartbeat = millis();
+        
         if(cmd == "stream_on"){
             streaming = true;
         }
@@ -1027,12 +1108,22 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             sendSensorDataToFirebase(currentTemp, currentHum, currentPressure);
         }
     }
+    else if(type == WStype_PING || type == WStype_PONG) {
+        lastServerHeartbeat = millis();
+    }
 }
 
 void soundTask(void *pvParameters) {
     while (1) {
         if (millis() - lastI2SInit > 1000) {
             sendAudio();
+            
+            // Проверяем громкие звуки для алертов (только если должны обрабатывать Telegram)
+            if (shouldHandleTelegram() && detectLoudSound()) {
+                sound_event_t event = {detectSoundRMS(), millis()};
+                xQueueSend(soundEventQueue, &event, 0);
+            }
+            
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -1057,7 +1148,7 @@ void setup() {
     Wire.begin(21,47);
     initI2S();
 
-    soundEventQueue = xQueueCreate(5, sizeof(int)); 
+    soundEventQueue = xQueueCreate(5, sizeof(sound_event_t)); 
     audioQueue = xQueueCreate(20, sizeof(audio_packet_t));
     if (audioQueue == NULL) {
         Serial.println("Failed to create audio queue");
@@ -1136,9 +1227,12 @@ void setup() {
     
     updateDisplay();
     
-    String startupMsg = "ESP32 Camera System Started!\n";
-    startupMsg += "Firebase: " + String(firebaseReady ? "Connected" : "Disconnected");
-    sendTelegramMessage(chatID, startupMsg);
+    // Отправляем статус в Telegram только если сервер не подключен
+    if (shouldHandleTelegram()) {
+        String startupMsg = "ESP32 Camera System Started! (Standalone Mode)\n";
+        startupMsg += "Firebase: " + String(firebaseReady ? "Connected" : "Disconnected");
+        sendTelegramMessage(chatID, startupMsg);
+    }
     
     Serial.println("Setup completed!");
 }
@@ -1148,7 +1242,14 @@ void loop() {
     ws.loop();
     xSemaphoreGiveRecursive(wsMutex);
     
-    if (millis() - lastTelegramCheck > TELEGRAM_POLL_INTERVAL) {
+    // Проверяем таймаут сервера
+    if (serverConnected && (millis() - lastServerHeartbeat > SERVER_TIMEOUT)) {
+        serverConnected = false;
+        Serial.println("Server timeout - switching to standalone mode. Telegram handling enabled.");
+    }
+    
+    // Проверяем сообщения Telegram только в автономном режиме
+    if (shouldHandleTelegram() && (millis() - lastTelegramCheck > TELEGRAM_POLL_INTERVAL)) {
         checkTelegramMessages();
         lastTelegramCheck = millis();
     }
@@ -1193,13 +1294,23 @@ void loop() {
         lastButtonState = reading;
     }
 
-    int soundEvent;
+    // Проверяем события громкого звука
+    sound_event_t soundEvent;
     if (xQueueReceive(soundEventQueue, &soundEvent, 0) == pdTRUE) {
-        if (millis() - lastTrigger > REFRACTORY_MS) {
+        if (shouldHandleTelegram() && (millis() - lastTrigger > REFRACTORY_MS)) {
             lastTrigger = millis();
-            xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
-            ws.sendTXT("sound");
-            xSemaphoreGiveRecursive(wsMutex);
+            Serial.printf("Loud sound detected! RMS: %d\n", soundEvent.rms);
+            
+            // Отправляем алерт с громким звуком
+            checkAndSendAlert(currentTemp, currentHum, currentPressure, true);
+        } else if (serverConnected) {
+            // Если сервер подключен, просто отправляем уведомление на сервер
+            if (millis() - lastTrigger > REFRACTORY_MS) {
+                lastTrigger = millis();
+                xSemaphoreTakeRecursive(wsMutex, portMAX_DELAY);
+                ws.sendTXT("loud_sound");
+                xSemaphoreGiveRecursive(wsMutex);
+            }
         }
     }
 
@@ -1228,7 +1339,10 @@ void loop() {
         ws.sendTXT(msg);
         xSemaphoreGiveRecursive(wsMutex);
         
-        checkAndSendAlert(temp, hum, pres);
+        // Отправляем алерты только в автономном режиме и только по датчикам
+        if (shouldHandleTelegram()) {
+            checkAndSendAlert(temp, hum, pres, false);
+        }
     }
 
     if (now - lastFirebaseUpdate > FIREBASE_UPDATE_INTERVAL) {
@@ -1241,4 +1355,3 @@ void loop() {
         sendPhoto();
     }
 }
-```
