@@ -12,6 +12,9 @@ import aiohttp
 from aiohttp import web
 from collections import deque
 
+# ============================================================
+# Настройка логирования
+# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -19,11 +22,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# Конфигурация Telegram
+# ============================================================
 TELEGRAM_BOT_TOKEN = "7644572719:AAHr0MIQVg7U5_2dibiUGIIfrVqIulMdI9c"
 TELEGRAM_CHAT_ID = "949226271"
 TELEGRAM_POLL_INTERVAL = 2
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# ============================================================
+# Загрузка модели детектора плача
+# ============================================================
 MODEL_PATH = '/Users/hannakaliada/Desktop/БГУИР/cry_detector.pkl'
 try:
     cry_detector = joblib.load(MODEL_PATH)
@@ -32,6 +41,9 @@ except FileNotFoundError:
     logger.error(f"Модель не найдена по пути: {MODEL_PATH}")
     cry_detector = None
 
+# ============================================================
+# Параметры аудиоанализа
+# ============================================================
 SR = 16000
 FRAME_SIZE = 0.025
 HOP_SIZE = 0.010
@@ -53,10 +65,14 @@ FEATURE_COLS = [
     'mfcc_6', 'mfcc_7', 'mfcc_8', 'mfcc_9', 'mfcc_10', 'mfcc_11', 'mfcc_12', 'mfcc_13'
 ]
 
+# Пороги для датчиков
 TEMP_MIN, TEMP_MAX = 18.0, 26.0
 HUM_MIN, HUM_MAX = 40.0, 60.0
 PRES_MIN, PRES_MAX = 738.0, 760.0
 
+# ============================================================
+# Глобальное состояние
+# ============================================================
 esp_clients = {}
 browser_clients = set()
 stream_clients = set()
@@ -67,12 +83,11 @@ audio_buffer = deque(maxlen=SR * 10)
 last_cry_time = 0
 CRY_ALERT_COOLDOWN = 30
 last_telegram_update_id = 0
+cry_audio_buffer = bytearray()  # Буфер для накопления аудио плача
 
-recording_audio = False
-recording_samples = []
-RECORDING_DURATION = 5
-recording_start_time = 0
-
+# ============================================================
+# Функции аудиоанализа (извлечение признаков)
+# ============================================================
 def extract_energy_segments(audio, sr):
     frame_len = int(FRAME_SIZE * sr)
     hop_len = int(HOP_SIZE * sr)
@@ -100,6 +115,7 @@ def extract_energy_segments(audio, sr):
             segments.append((start_time, end_time))
     return segments
 
+
 def compute_pitch_autocorrelation(segment_audio, sr, fmin=200, fmax=600):
     frame_len = int(0.050 * sr)
     hop_len = int(0.025 * sr)
@@ -113,13 +129,23 @@ def compute_pitch_autocorrelation(segment_audio, sr, fmin=200, fmax=600):
         autocorr = np.correlate(x, x, mode='full')
         autocorr = autocorr[len(x) - 1:]
         norm = autocorr[0]
-        if norm < 1e-10: continue
+        if norm < 1e-10:
+            continue
         autocorr_norm = autocorr / norm
-        s = autocorr_norm[min_lag:max_lag+1] if len(autocorr_norm) > max_lag else autocorr_norm[min_lag:]
-        if len(s) == 0: continue
-        pi, pv = np.argmax(s), s[np.argmax(s)]
-        if pv > 0.35: pitches.append(sr / (min_lag + pi))
+        if len(autocorr_norm) <= max_lag:
+            search = autocorr_norm[min_lag:]
+        else:
+            search = autocorr_norm[min_lag:max_lag + 1]
+        if len(search) == 0:
+            continue
+        peak_idx = np.argmax(search)
+        peak_val = search[peak_idx]
+        if peak_val > 0.35:
+            lag = min_lag + peak_idx
+            f0 = sr / lag
+            pitches.append(f0)
     return np.mean(pitches) if pitches else np.nan
+
 
 def compute_spectral_band_energies(segment_audio, sr):
     n_fft = 1024
@@ -129,105 +155,263 @@ def compute_spectral_band_energies(segment_audio, sr):
     energies = {}
     for low, high, name in BANDS:
         idx = np.where((freqs >= low) & (freqs <= high))[0]
-        energies[name] = np.sum(D[idx, :]) / (total_energy + 1e-12)
+        band_energy = np.sum(D[idx, :])
+        energies[name] = band_energy / total_energy if total_energy > 1e-12 else 0.0
     return energies
+
 
 def compute_rise_fall_times(segment_audio, sr):
     abs_audio = np.abs(segment_audio)
-    win = max(1, int(0.010 * sr))
-    envelope = np.convolve(abs_audio, np.ones(win)/win, mode='same')
-    if np.max(envelope) < 1e-10: return 0.0, 0.0
-    env_norm = envelope / np.max(envelope)
-    a10, a90 = np.where(env_norm >= 0.1)[0], np.where(env_norm >= 0.9)[0]
-    rt = (a90[0] - a10[0]) / sr if len(a10) and len(a90) else 0.0
-    ren = env_norm[::-1]
-    a10r, a90r = np.where(ren >= 0.1)[0], np.where(ren >= 0.9)[0]
-    ft = abs(a90r[0] - a10r[0]) / sr if len(a10r) and len(a90r) else 0.0
-    return rt, ft
+    win_samples = int(0.010 * sr)
+    if win_samples < 1:
+        win_samples = 1
+    envelope = np.convolve(abs_audio, np.ones(win_samples) / win_samples, mode='same')
+    max_val = np.max(envelope)
+    if max_val < 1e-10:
+        return 0.0, 0.0
+    env_norm = envelope / max_val
+    above_10 = np.where(env_norm >= 0.1)[0]
+    above_90 = np.where(env_norm >= 0.9)[0]
+    rise_time = (above_90[0] - above_10[0]) / sr if len(above_10) and len(above_90) else 0.0
+    rev_env = env_norm[::-1]
+    above_10_rev = np.where(rev_env >= 0.1)[0]
+    above_90_rev = np.where(rev_env >= 0.9)[0]
+    fall_time = (above_90_rev[0] - above_10_rev[0]) / sr if len(above_10_rev) and len(above_90_rev) else 0.0
+    if fall_time < 0:
+        fall_time = abs(fall_time)
+    return rise_time, fall_time
 
-def extract_features(seg, sr, pp, np_):
-    d = len(seg) / sr
-    pa, ma = np.max(np.abs(seg)), np.mean(np.abs(seg))
-    rt, ft = compute_rise_fall_times(seg, sr)
-    f0 = compute_pitch_autocorrelation(seg, sr)
-    se = compute_spectral_band_energies(seg, sr)
-    mf = np.mean(librosa.feature.mfcc(y=seg, sr=sr, n_mfcc=13, n_fft=int(0.050*sr), hop_length=int(0.025*sr)), axis=1)
-    fe = {'duration': d, 'prev_pause': pp, 'next_pause': np_,
-          'peak_amplitude': pa, 'mean_amplitude': ma,
-          'rise_time': rt, 'fall_time': ft,
-          'mean_f0': f0 if not np.isnan(f0) else 0.0}
-    fe.update({f'spec_{k}': v for k, v in se.items()})
-    fe.update({f'mfcc_{i+1}': mf[i] for i in range(13)})
-    return fe
 
+def extract_features(segment_audio, sr, prev_pause, next_pause):
+    duration = len(segment_audio) / sr
+    peak_amp = np.max(np.abs(segment_audio))
+    mean_amp = np.mean(np.abs(segment_audio))
+    rise_t, fall_t = compute_rise_fall_times(segment_audio, sr)
+    mean_f0 = compute_pitch_autocorrelation(segment_audio, sr)
+    spec_energies = compute_spectral_band_energies(segment_audio, sr)
+    mfcc = librosa.feature.mfcc(y=segment_audio, sr=sr, n_mfcc=13,
+                                n_fft=int(0.050 * sr), hop_length=int(0.025 * sr))
+    mfcc_means = np.mean(mfcc, axis=1)
+    features = {
+        'duration': duration, 'prev_pause': prev_pause, 'next_pause': next_pause,
+        'peak_amplitude': peak_amp, 'mean_amplitude': mean_amp,
+        'rise_time': rise_t, 'fall_time': fall_t,
+        'mean_f0': mean_f0 if not np.isnan(mean_f0) else 0.0
+    }
+    for name, val in spec_energies.items():
+        features[f'spec_{name}'] = val
+    for i in range(13):
+        features[f'mfcc_{i + 1}'] = mfcc_means[i]
+    return features
+
+
+# ============================================================
+# Telegram API функции
+# ============================================================
 async def telegram_api_call(method: str, params: dict = None, files: dict = None):
     url = f"{TELEGRAM_API_URL}/{method}"
     try:
         async with aiohttp.ClientSession() as session:
             if files:
                 form = aiohttp.FormData()
-                for k, v in (params or {}).items(): form.add_field(k, str(v))
-                for fn, fd in files.items(): form.add_field(fn, fd['data'], filename=fd.get('fn','file'), content_type=fd.get('ct','application/octet-stream'))
-                async with session.post(url, data=form) as r: return await r.json()
-            async with session.post(url, json=params) as r: return await r.json()
-    except Exception as e: logger.error(f"Ошибка Telegram API: {e}"); return None
+                for key, value in (params or {}).items():
+                    form.add_field(key, str(value))
+                for field_name, file_data in files.items():
+                    form.add_field(field_name, file_data['data'],
+                                   filename=file_data.get('filename', 'file'),
+                                   content_type=file_data.get('content_type', 'application/octet-stream'))
+                async with session.post(url, data=form) as resp:
+                    return await resp.json()
+            else:
+                async with session.post(url, json=params) as resp:
+                    return await resp.json()
+    except Exception as e:
+        logger.error(f"Telegram API call failed ({method}): {e}")
+        return None
+
 
 async def send_telegram_message(text: str):
-    await telegram_api_call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"})
+    result = await telegram_api_call("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    })
+    if result and result.get("ok"):
+        logger.info("Telegram message sent")
+    else:
+        logger.error(f"Telegram sendMessage failed: {result}")
+
 
 async def send_telegram_photo(image_bytes: bytes, caption: str = ""):
-    await telegram_api_call("sendPhoto", {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                           {"photo": {"data": image_bytes, "fn": "photo.jpg", "ct": "image/jpeg"}})
+    result = await telegram_api_call("sendPhoto",
+                                     {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                                     {"photo": {"data": image_bytes, "filename": "photo.jpg",
+                                                "content_type": "image/jpeg"}}
+                                     )
+    if result and result.get("ok"):
+        logger.info("Telegram photo sent")
+    else:
+        logger.error(f"Telegram sendPhoto failed: {result}")
 
-async def send_telegram_voice(audio_data: np.ndarray, caption: str = ""):
-    audio_int16 = (audio_data * 32767).astype(np.int16).tobytes()
+
+async def send_telegram_voice(audio_bytes: bytes, caption: str = ""):
+    """Отправка голосового сообщения в Telegram."""
+    # Конвертируем PCM 16-bit в WAV
     wav_buf = io.BytesIO()
     with wave.open(wav_buf, 'wb') as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SR); wf.writeframes(audio_int16)
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(SR)
+        wf.writeframes(audio_bytes)
     wav_buf.seek(0)
-    await telegram_api_call("sendVoice", {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                           {"voice": {"data": wav_buf.read(), "fn": "cry.ogg", "ct": "audio/ogg"}})
+
+    result = await telegram_api_call("sendVoice",
+                                     {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                                     {"voice": {"data": wav_buf.read(), "filename": "cry_audio.ogg",
+                                                "content_type": "audio/ogg"}}
+                                     )
+    if result and result.get("ok"):
+        logger.info("Telegram voice sent")
+    else:
+        logger.error(f"Telegram sendVoice failed: {result}")
+
 
 async def check_telegram_updates():
     global last_telegram_update_id
-    r = await telegram_api_call("getUpdates", {"timeout": 5, "offset": last_telegram_update_id + 1})
-    if not r or not r.get("ok"): return
-    for u in r.get("result", []):
-        if u.get("update_id", 0) > last_telegram_update_id: last_telegram_update_id = u["update_id"]
-        msg = u.get("message")
-        if msg and msg.get("text"): await handle_telegram_command(str(msg["chat"]["id"]), msg["text"].strip())
+    params = {"timeout": 5, "offset": last_telegram_update_id + 1}
+    result = await telegram_api_call("getUpdates", params)
+    if not result or not result.get("ok"):
+        return
+    for update in result.get("result", []):
+        update_id = update.get("update_id", 0)
+        if update_id > last_telegram_update_id:
+            last_telegram_update_id = update_id
+        message = update.get("message")
+        if not message:
+            continue
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        text = message.get("text", "")
+        if text:
+            await handle_telegram_command(chat_id, text.strip())
+
 
 async def handle_telegram_command(chat_id: str, text: str):
-    t = text.lower()
-    if t in ["/start", "/help"]:
-        await send_telegram_message("Команды:\n/photo - фото\n/stream_on - включить стрим\n/stream_off - выключить стрим\n/audio_on - включить аудио\n/audio_off - выключить аудио\n/sensors - датчики\n/status - статус\n/light_on - свет\n/reboot - перезагрузка")
-    elif t == "/photo": await send_to_esp("photo"); await send_telegram_message("Фото...")
-    elif t == "/stream_on": await send_to_esp("stream_on"); await send_telegram_message("Стрим включен")
-    elif t == "/stream_off": await send_to_esp("stream_off"); await send_telegram_message("Стрим выключен")
-    elif t == "/audio_on": await send_to_esp("audio_on"); await send_telegram_message("Аудио включено")
-    elif t == "/audio_off": await send_to_esp("audio_off"); await send_telegram_message("Аудио выключено")
-    elif t == "/sensors":
-        await send_telegram_message(f"Температура: {last_sensor_data['temp']:.1f} C\nВлажность: {last_sensor_data['hum']:.1f}%\nДавление: {last_sensor_data['pres']:.1f} мм")
-    elif t == "/status":
-        await send_telegram_message(f"ESP клиентов: {len(esp_clients)}\nВеб клиентов: {len(browser_clients)}")
-    elif t == "/reboot": await send_to_esp("reboot")
-    elif t.startswith("/light"): await send_to_esp(t[1:])
+    text_lower = text.lower()
+    logger.info(f"Telegram command from {chat_id}: {text}")
 
-async def check_sensor_thresholds(temp, hum, pres):
+    if text_lower in ["/start", "/help"]:
+        help_text = (
+            "🤖 <b>Сістэма маніторынгу ESP32</b>\n\n"
+            "📷 <b>Камера:</b>\n"
+            "/photo — Зрабіць фота\n"
+            "/stream_on — Уключыць стрым\n"
+            "/stream_off — Выключыць стрым\n\n"
+            "🎤 <b>Аўдыё:</b>\n"
+            "/audio_on — Уключыць аўдыё\n"
+            "/audio_off — Выключыць аўдыё\n\n"
+            "🌡 <b>Датчыкі:</b>\n"
+            "/sensors — Паказанні датчыкаў\n\n"
+            "💡 <b>Начнік:</b>\n"
+            "/light_on — Уключыць\n"
+            "/light_off — Выключыць\n"
+            "/light_soft — Цёплае святло\n"
+            "/light_white — Белае святло\n"
+            "/light_rainbow — Вясёлка\n"
+            "/light_bright_50 — Яркасць 50%\n\n"
+            "📊 <b>Сістэма:</b>\n"
+            "/status — Статус сістэмы\n"
+            "/reboot — Перазагрузка ESP"
+        )
+        await send_telegram_message(help_text)
+
+    elif text_lower == "/photo":
+        await send_to_esp("photo")
+        await send_telegram_message("📸 Раблю фота...")
+
+    elif text_lower == "/stream_on":
+        await send_to_esp("stream_on")
+        await send_telegram_message("✅ Стрым уключаны")
+
+    elif text_lower == "/stream_off":
+        await send_to_esp("stream_off")
+        await send_telegram_message("✅ Стрым выключаны")
+
+    elif text_lower == "/audio_on":
+        await send_to_esp("audio_on")
+        await send_telegram_message("✅ Аўдыё ўключана")
+
+    elif text_lower == "/audio_off":
+        await send_to_esp("audio_off")
+        await send_telegram_message("✅ Аўдыё выключана")
+
+    elif text_lower == "/sensors":
+        t = last_sensor_data["temp"]
+        h = last_sensor_data["hum"]
+        p = last_sensor_data["pres"]
+        msg = f"🌡 <b>Паказанні датчыкаў:</b>\nТэмпература: {t:.1f}°C\nВільготнасць: {h:.1f}%\nЦіск: {p:.1f} мм рт.сл."
+        await send_telegram_message(msg)
+
+    elif text_lower == "/status":
+        esp_count = len(esp_clients)
+        browser_count = len(browser_clients)
+        msg = (f"📊 <b>Статус сістэмы:</b>\n"
+               f"ESP32 падключана: {esp_count}\n"
+               f"Браўзераў падключана: {browser_count}\n"
+               f"Дэтэктар плачу: {'актыўны' if cry_detector else 'не загружаны'}")
+        await send_telegram_message(msg)
+
+    elif text_lower == "/reboot":
+        await send_to_esp("reboot")
+        await send_telegram_message("🔄 Каманда перазагрузкі адпраўлена")
+
+    elif text_lower.startswith("/light"):
+        await send_to_esp(text_lower.replace("/", ""))
+        await send_telegram_message(f"💡 Каманда адпраўлена: {text}")
+
+    else:
+        await send_telegram_message("Невядомая каманда. Выкарыстоўвайце /help для спісу каманд.")
+
+
+# ============================================================
+# Проверка порогов датчиков
+# ============================================================
+async def check_sensor_thresholds(temp: float, hum: float, pres: float):
     alerts = []
-    if temp < TEMP_MIN: alerts.append(f"Низкая температура: {temp:.1f} C")
-    elif temp > TEMP_MAX: alerts.append(f"Высокая температура: {temp:.1f} C")
-    if hum < HUM_MIN: alerts.append(f"Низкая влажность: {hum:.1f}%")
-    elif hum > HUM_MAX: alerts.append(f"Высокая влажность: {hum:.1f}%")
-    if pres < PRES_MIN: alerts.append(f"Низкое давление: {pres:.1f}")
-    elif pres > PRES_MAX: alerts.append(f"Высокое давление: {pres:.1f}")
-    if alerts: await send_telegram_message("Предупреждение:\n"+"\n".join(alerts)); await send_to_esp("photo")
+    if temp < TEMP_MIN:
+        alerts.append(f"❄️ Нізкая тэмпература: {temp:.1f}°C (норма: {TEMP_MIN}-{TEMP_MAX}°C)")
+    elif temp > TEMP_MAX:
+        alerts.append(f"🔥 Высокая тэмпература: {temp:.1f}°C (норма: {TEMP_MIN}-{TEMP_MAX}°C)")
+    if hum < HUM_MIN:
+        alerts.append(f"💧 Нізкая вільготнасць: {hum:.1f}% (норма: {HUM_MIN}-{HUM_MAX}%)")
+    elif hum > HUM_MAX:
+        alerts.append(f"💦 Высокая вільготнасць: {hum:.1f}% (норма: {HUM_MIN}-{HUM_MAX}%)")
+    if pres < PRES_MIN:
+        alerts.append(f"📉 Нізкі ціск: {pres:.1f} мм рт.сл. (норма: {PRES_MIN}-{PRES_MAX})")
+    elif pres > PRES_MAX:
+        alerts.append(f"📈 Высокі ціск: {pres:.1f} мм рт.сл. (норма: {PRES_MIN}-{PRES_MAX})")
 
-async def analyze_audio_for_cry(audio_data):
-    global last_cry_time, last_image, recording_audio, recording_samples, recording_start_time
+    if alerts:
+        alert_msg = "⚠️ <b>Увага! Выяўлены адхіленні:</b>\n" + "\n".join(alerts)
+        await send_telegram_message(alert_msg)
+        await send_to_esp("photo")
+
+
+# ============================================================
+# Детектор плача
+# ============================================================
+async def analyze_audio_for_cry(audio_data, raw_audio_bytes=None):
+    global last_cry_time, last_image, cry_audio_buffer
 
     if cry_detector is None or len(audio_data) < SR * 0.5:
         return False
+
+    # Накапливаем сырые аудиоданные для отправки при обнаружении плача
+    if raw_audio_bytes:
+        cry_audio_buffer.extend(raw_audio_bytes)
+        # Держим буфер не более 15 секунд
+        max_bytes = SR * 15 * 2  # 15 сек * 2 байта на семпл
+        if len(cry_audio_buffer) > max_bytes:
+            cry_audio_buffer = cry_audio_buffer[-max_bytes:]
 
     audio = np.array(audio_data, dtype=np.float32)
     audio = audio / (np.max(np.abs(audio)) + 1e-10)
@@ -235,10 +419,12 @@ async def analyze_audio_for_cry(audio_data):
     cry_segments, total_segments, max_cry_prob = 0, 0, 0.0
 
     for start, end in segments:
-        seg_audio = audio[int(start*SR):int(end*SR)]
-        rms = np.sqrt(np.mean(seg_audio**2))
+        seg_audio = audio[int(start * SR):int(end * SR)]
+        rms = np.sqrt(np.mean(seg_audio ** 2))
         peak = np.max(np.abs(seg_audio))
-        if peak / (rms + 1e-10) < MIN_PEAK_TO_RMS_RATIO or (end - start) < 0.2: continue
+        peak_to_rms = peak / rms if rms > 1e-10 else 1.0
+        if peak_to_rms < MIN_PEAK_TO_RMS_RATIO or (end - start) < 0.2:
+            continue
         total_segments += 1
         features = extract_features(seg_audio, SR, 0.5, 0.5)
         X = np.array([[features.get(col, 0.0) for col in FEATURE_COLS]])
@@ -247,74 +433,103 @@ async def analyze_audio_for_cry(audio_data):
             cry_segments += 1
             max_cry_prob = max(max_cry_prob, proba[0][1])
 
-    current_time = time.time()
-
-    if recording_audio and (current_time - recording_start_time >= RECORDING_DURATION):
-        recording_audio = False
-        if recording_samples:
-            recorded = np.array(recording_samples, dtype=np.float32)
-            logger.info(f"Запись завершена: {len(recorded)/SR:.1f} сек, отправка в Telegram")
-            await send_telegram_voice(recorded, caption=f"Аудио плача ({len(recorded)/SR:.1f} сек)")
-            recording_samples = []
-
-    if total_segments > 0 and cry_segments > 0 and cry_segments / total_segments > 0.3:
-        if current_time - last_cry_time > CRY_ALERT_COOLDOWN:
+    if total_segments > 0 and cry_segments > 0:
+        cry_ratio = cry_segments / total_segments
+        current_time = asyncio.get_event_loop().time()
+        if cry_ratio > 0.3 and current_time - last_cry_time > CRY_ALERT_COOLDOWN:
             last_cry_time = current_time
-            logger.warning(f"Обнаружен детский плач! ({cry_segments}/{total_segments})")
+            logger.warning(f"ДЗІЦЯЧЫ ПЛАЧ! ({cry_segments}/{total_segments} сегментаў)")
 
-            recording_audio = True
-            recording_samples = []
-            recording_start_time = current_time
-            logger.info(f"Начата запись {RECORDING_DURATION} секунд аудио после обнаружения плача")
-
+            # Отправляем текстовое уведомление
             await send_telegram_message(
-                f"Обнаружен детский плач!\n\n"
-                f"Вероятность: {max_cry_prob:.1%}\n"
-                f"Сегментов плача: {cry_segments} из {total_segments}\n"
-                f"Записываю {RECORDING_DURATION} сек аудио..."
+                f"<b>⚠️ Заўважаны дзіцячы плач!</b>\n\n"
+                f"Верагоднасць: {max_cry_prob:.1%}\n"
+                f"Сегментаў плачу: {cry_segments} з {total_segments}"
             )
-            if last_image:
-                await send_telegram_photo(last_image, caption=f"Фото при обнаружении плача\nВероятность: {max_cry_prob:.1%}")
+
+            # Отправляем фото
+            if last_image is not None:
+                await send_telegram_photo(last_image,
+                                          caption=f"📸 Фота пры выяўленні плачу\nВерагоднасць: {max_cry_prob:.1%}")
+
+            # Отправляем аудиофрагмент (последние 5+ секунд из буфера)
+            if len(cry_audio_buffer) > 0:
+                # Берём последние 5 секунд аудио
+                five_sec_bytes = SR * 5 * 2  # 5 сек * 2 байта/семпл
+                audio_chunk = bytes(cry_audio_buffer[-five_sec_bytes:]) if len(
+                    cry_audio_buffer) > five_sec_bytes else bytes(cry_audio_buffer)
+                await send_telegram_voice(audio_chunk,
+                                          caption=f"🔊 Аўдыё плачу\nВерагоднасць: {max_cry_prob:.1%}\nПрацягласць: ~{len(audio_chunk) / (SR * 2):.1f}с")
+                cry_audio_buffer = bytearray()  # Очищаем буфер после отправки
+
             await notify_browsers({"type": "cry_alert", "probability": max_cry_prob})
             return True
     return False
 
+
+# ============================================================
+# Отправка команд на ESP32 и уведомлений браузерам
+# ============================================================
 async def send_to_esp(cmd: str):
     dead = []
     for esp_id, ws in esp_clients.items():
-        try: await ws.send_str(cmd)
-        except: dead.append(esp_id)
-    for d in dead: del esp_clients[d]
+        try:
+            await ws.send_str(cmd)
+        except Exception as e:
+            logger.warning(f"Failed to send command to ESP {esp_id}: {e}")
+            dead.append(esp_id)
+    for d in dead:
+        del esp_clients[d]
+
 
 async def notify_browsers(data: dict):
     dead = []
     for ws in browser_clients:
-        try: await ws.send_str(json.dumps(data))
-        except: dead.append(ws)
-    for d in dead: browser_clients.discard(d)
+        try:
+            await ws.send_str(json.dumps(data))
+        except Exception as e:
+            logger.warning(f"Failed to notify browser: {e}")
+            dead.append(ws)
+    for d in dead:
+        browser_clients.discard(d)
 
+
+# ============================================================
+# Фоновые задачи
+# ============================================================
 async def telegram_polling_task():
     while True:
         await asyncio.sleep(TELEGRAM_POLL_INTERVAL)
-        try: await check_telegram_updates()
-        except: pass
+        try:
+            await check_telegram_updates()
+        except Exception as e:
+            logger.error(f"Telegram polling error: {e}")
+
 
 async def heartbeat_task():
     while True:
         await asyncio.sleep(5)
         dead = []
         for esp_id, ws in esp_clients.items():
-            try: await ws.send_str("heartbeat")
-            except: dead.append(esp_id)
-        for d in dead: del esp_clients[d]
+            try:
+                await ws.send_str("heartbeat")
+            except Exception:
+                dead.append(esp_id)
+        for d in dead:
+            logger.warning(f"ESP32 {d} disconnected (heartbeat failed)")
+            del esp_clients[d]
 
+
+# ============================================================
+# HTML страница на белорусском языке с работающим звуком
+# ============================================================
 HTML_PAGE = """
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="be">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>Baby Monitor - Наблюдение за ребенком</title>
+<title>Baby Monitor — Сачэнне за дзіцём</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 :root {
@@ -414,8 +629,8 @@ body {
     <div style="display:flex;align-items:center;gap:12px">
         <div class="logo">👶</div>
         <div>
-            <div class="header-title">Наблюдение за ребенком</div>
-            <div class="header-subtitle"><span class="status-dot"></span> Система активна</div>
+            <div class="header-title">Сачэнне за дзіцём</div>
+            <div class="header-subtitle"><span class="status-dot"></span> Сістэма актыўная</div>
         </div>
     </div>
     <div style="text-align:right">
@@ -426,39 +641,39 @@ body {
 
 <div class="alert-overlay" id="alertOverlay">
     <span class="alert-icon">⚠️</span>
-    <span>Обнаружен детский плач!</span>
+    <span>Заўважаны дзіцячы плач!</span>
 </div>
 
 <div class="video-container">
-    <img src="/stream" id="videoFeed" alt="Видео">
+    <img src="/stream" id="videoFeed" alt="Відэа">
 </div>
 
 <div class="stats-bar">
     <div class="stat-card">
         <div class="stat-value" id="statTemp">--°</div>
-        <div class="stat-label">Температура</div>
+        <div class="stat-label">Тэмпература</div>
     </div>
     <div class="stat-card">
         <div class="stat-value" id="statHum">--%</div>
-        <div class="stat-label">Влажность</div>
+        <div class="stat-label">Вільготнасць</div>
     </div>
     <div class="stat-card">
         <div class="stat-value" id="statPres">--</div>
-        <div class="stat-label">Давление</div>
+        <div class="stat-label">Ціск</div>
     </div>
     <div class="stat-card">
-        <div class="stat-value" id="statCry">Хорошо</div>
+        <div class="stat-value" id="statCry">Добра</div>
         <div class="stat-label">Статус</div>
     </div>
 </div>
 
 <div class="control-panel">
-    <button class="btn btn-primary" onclick="sendCmd('photo')">📸 Фото</button>
-    <button class="btn" onclick="sendCmd('stream_on')">▶️ Стрим</button>
+    <button class="btn btn-primary" onclick="sendCmd('photo')">📸 Фота</button>
+    <button class="btn" onclick="sendCmd('stream_on')">▶️ Стрым</button>
     <button class="btn" onclick="sendCmd('stream_off')">⏹️ Стоп</button>
-    <button class="btn" onclick="sendCmd('audio_on')">🎤 Аудио</button>
-    <button class="btn" onclick="sendCmd('audio_off')">🔇 Выкл</button>
-    <button class="btn btn-danger" onclick="sendCmd('light_on')">💡 Свет</button>
+    <button class="btn" onclick="sendCmd('audio_on')">🎤 Аўдыё</button>
+    <button class="btn" onclick="sendCmd('audio_off')">🔇 Глушыць</button>
+    <button class="btn btn-danger" onclick="sendCmd('light_on')">💡 Святло</button>
 </div>
 
 <script>
@@ -469,9 +684,9 @@ function sendCmd(cmd) {
 function updateClock() {
     var now = new Date();
     document.getElementById('clock').textContent = 
-        now.toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'});
+        now.toLocaleTimeString('be-BY', {hour:'2-digit', minute:'2-digit'});
     document.getElementById('date').textContent = 
-        now.toLocaleDateString('ru-RU', {day:'numeric', month:'long', weekday:'short'});
+        now.toLocaleDateString('be-BY', {day:'numeric', month:'long', weekday:'short'});
 }
 updateClock();
 setInterval(updateClock, 10000);
@@ -490,12 +705,15 @@ function showCryAlert() {
     document.getElementById('statCry').style.webkitTextFillColor = '#e74c3c';
     setTimeout(function() {
         overlay.classList.remove('show');
-        document.getElementById('statCry').textContent = 'Хорошо';
+        document.getElementById('statCry').textContent = 'Добра';
         document.getElementById('statCry').style.color = '';
         document.getElementById('statCry').style.webkitTextFillColor = '';
     }, 5000);
 }
 
+// ============================================================
+// WebSocket и аудио
+// ============================================================
 var ws;
 var audioCtx = null;
 var audioTime = 0;
@@ -565,13 +783,20 @@ connectWebSocket();
 </html>
 """
 
+
+# ============================================================
+# HTTP и WebSocket обработчики
+# ============================================================
 async def index(request):
     return web.Response(text=HTML_PAGE, content_type="text/html")
 
+
 async def cmd(request):
     c = request.query.get("c")
-    if c: await send_to_esp(c)
+    if c:
+        await send_to_esp(c)
     return web.Response(text="ok")
+
 
 async def stream(request):
     resp = web.StreamResponse(status=200, headers={
@@ -580,29 +805,40 @@ async def stream(request):
     })
     await resp.prepare(request)
     stream_clients.add(resp)
+    logger.info("Stream client connected")
     if last_image:
-        try: await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + last_image + b"\r\n")
-        except: pass
+        try:
+            await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + last_image + b"\r\n")
+        except Exception as e:
+            logger.error(f"Error sending last frame: {e}")
     try:
-        while True: await asyncio.sleep(3600)
-    finally: stream_clients.discard(resp)
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        stream_clients.discard(resp)
+
 
 async def browser_ws(request):
     ws = web.WebSocketResponse(heartbeat=60)
     await ws.prepare(request)
     browser_clients.add(ws)
-    try: await asyncio.sleep(3600)
-    finally: browser_clients.discard(ws)
+    logger.info("Browser connected")
+    try:
+        async for _ in ws:
+            pass
+    finally:
+        browser_clients.discard(ws)
     return ws
 
+
 async def esp_ws(request):
-    global last_image, last_sensor_data, last_sensor_time, recording_samples
+    global last_image, last_sensor_data, last_sensor_time
     ws = web.WebSocketResponse(heartbeat=60, max_msg_size=0, protocols=("arduino",))
     await ws.prepare(request)
     esp_id = str(int(time.time() * 1000))
     esp_clients[esp_id] = ws
-    logger.info(f"ESP32 подключен (ID: {esp_id})")
-    await send_telegram_message("ESP32 подключена к серверу")
+    logger.info(f"ESP32 connected (ID: {esp_id})")
+    await send_telegram_message("✅ ESP32 падключана да сервера")
     buffer = bytearray()
 
     try:
@@ -624,29 +860,28 @@ async def esp_ws(request):
                         await push_frame(payload)
 
                     elif pkt_type == 2:
-                        dead = []
-                        for b in browser_clients:
-                            try: await b.send_bytes(payload)
-                            except: dead.append(b)
-                        for d in dead: browser_clients.discard(d)
-
                         audio_samples = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
                         audio_buffer.extend(audio_samples)
-
-                        if recording_audio:
-                            recording_samples.extend(audio_samples.tolist())
-
-                        await analyze_audio_for_cry(list(audio_buffer))
+                        # Передаём сырые байты для накопления в буфере плача
+                        await analyze_audio_for_cry(list(audio_buffer), raw_audio_bytes=payload)
+                        dead = []
+                        for b in browser_clients:
+                            try:
+                                await b.send_bytes(payload)
+                            except Exception:
+                                dead.append(b)
+                        for d in dead:
+                            browser_clients.discard(d)
 
             elif msg.type == web.WSMsgType.TEXT:
                 text = msg.data
-                logger.info(f"Текст ESP: {text}")
+                logger.info(f"ESP text: {text}")
 
                 if text == "loud_sound":
-                    logger.info("Громкий звук обнаружен ESP32")
-                    await send_telegram_message("Обнаружен громкий звук!")
+                    logger.info("Loud sound detected by ESP32")
+                    await send_telegram_message("🔊 <b>Заўважаны гучны гук!</b>")
                     if last_image:
-                        await send_telegram_photo(last_image, "Фото при громком звуке")
+                        await send_telegram_photo(last_image, "📸 Фота пры гучным гуку")
 
                 elif text.startswith("temp:"):
                     try:
@@ -662,19 +897,20 @@ async def esp_ws(request):
                         })
                         await check_sensor_thresholds(temp, hum, pres)
                     except Exception as e:
-                        logger.error(f"Ошибка парсинга данных датчиков: {e}")
+                        logger.error(f"Failed to parse sensor data: {e}")
 
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"Ошибка WebSocket: {ws.exception()}")
+                logger.error(f"WebSocket error: {ws.exception()}")
 
     except Exception as e:
-        logger.error(f"Ошибка обработчика ESP: {e}")
+        logger.error(f"ESP handler error: {e}")
     finally:
         if esp_id in esp_clients:
             del esp_clients[esp_id]
-        logger.info(f"ESP32 отключена (ID: {esp_id})")
-        await send_telegram_message("ESP32 отключена от сервера")
+        logger.info(f"ESP32 disconnected (ID: {esp_id})")
+        await send_telegram_message("❌ ESP32 адключана ад сервера")
     return ws
+
 
 async def push_frame(frame: bytes):
     dead = []
@@ -686,6 +922,10 @@ async def push_frame(frame: bytes):
     for d in dead:
         stream_clients.discard(d)
 
+
+# ============================================================
+# Запуск приложения
+# ============================================================
 app = web.Application()
 app.router.add_get("/", index)
 app.router.add_get("/cmd", cmd)
@@ -693,12 +933,14 @@ app.router.add_get("/stream", stream)
 app.router.add_get("/browser", browser_ws)
 app.router.add_get("/ws", esp_ws)
 
+
 async def start_background_tasks(app):
     asyncio.create_task(telegram_polling_task())
     asyncio.create_task(heartbeat_task())
 
+
 app.on_startup.append(start_background_tasks)
 
 if __name__ == "__main__":
-    logger.info("Запуск сервера на порту 8080...")
+    logger.info("Запуск сервера на порце 8080...")
     web.run_app(app, host="0.0.0.0", port=8080)
